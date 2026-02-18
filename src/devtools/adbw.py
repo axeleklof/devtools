@@ -70,17 +70,22 @@ def _get_device_name(serial: str) -> str:
     return f"{brand} {model}" if brand else model
 
 
-def _discover_usb_devices() -> list[str]:
+def _parse_devices() -> tuple[list[str], set[str]]:
+    """Parse adb devices output. Returns (usb_serials, wireless_targets)."""
     result = _run_adb("devices")
     if result.returncode != 0:
         print("Error: Failed to list adb devices.", file=sys.stderr)
         sys.exit(1)
-    devices = []
+    usb: list[str] = []
+    wireless: set[str] = set()
     for line in result.stdout.splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[1] == "device" and ":" not in parts[0]:
-            devices.append(parts[0])
-    return devices
+        if len(parts) == 2 and parts[1] == "device":
+            if ":" in parts[0]:
+                wireless.add(parts[0])
+            else:
+                usb.append(parts[0])
+    return usb, wireless
 
 
 def _select_device(devices: list[str]) -> tuple[str, str]:
@@ -206,38 +211,49 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(1)
 
     device_name = ""
-    used_usb = False
+    already_connected = False
 
     if args.ip:
         ip = args.ip
     else:
-        used_usb = True
-        devices = _discover_usb_devices()
-        if not devices:
+        usb_devices, wireless_targets = _parse_devices()
+        if not usb_devices:
             print("Error: No USB devices found. Connect a device and enable USB debugging.", file=sys.stderr)
             sys.exit(1)
 
-        serial, device_name = _select_device(devices)
-        print(f"Setting up wireless ADB on {device_name} port {args.port}")
+        serial, device_name = _select_device(usb_devices)
 
         # Get IP before switching to tcpip mode
         ip = _get_device_ip(serial)
+        target = f"{ip}:{args.port}"
 
-        # Enable TCP/IP mode
-        r = _run_adb("tcpip", str(args.port), serial=serial)
-        output = (r.stdout + r.stderr).strip()
-        if r.returncode != 0 or "error" in output.lower():
-            print(f"Error: Failed to enable TCP/IP mode: {output}", file=sys.stderr)
-            sys.exit(1)
-
-    # Connect wirelessly
-    _connect(ip, args.port)
+        # Check if this device is already connected wirelessly
+        if target in wireless_targets:
+            already_connected = True
 
     target = f"{ip}:{args.port}"
-    if device_name:
-        print(f"Connected to {device_name} at {target}")
+
+    if already_connected:
+        print(f"Already connected to {device_name} at {target}")
     else:
-        print(f"Connected to {target}")
+        if device_name:
+            print(f"Setting up wireless ADB on {device_name} port {args.port}")
+
+        # Enable TCP/IP mode (only when coming from USB)
+        if not args.ip:
+            r = _run_adb("tcpip", str(args.port), serial=serial)
+            output = (r.stdout + r.stderr).strip()
+            if r.returncode != 0 or "error" in output.lower():
+                print(f"Error: Failed to enable TCP/IP mode: {output}", file=sys.stderr)
+                sys.exit(1)
+
+        # Connect wirelessly
+        _connect(ip, args.port)
+
+        if device_name:
+            print(f"Connected to {device_name} at {target}")
+        else:
+            print(f"Connected to {target}")
 
     # Reverse port forwarding
     if reverse_ports:
@@ -247,7 +263,7 @@ def main(argv: list[str] | None = None) -> None:
             if r.returncode != 0:
                 print(f"Warning: Failed to reverse port {rp}.", file=sys.stderr)
 
-    if used_usb:
+    if not already_connected and not args.ip:
         print("You can now disconnect the USB cable.")
 
 
