@@ -34,7 +34,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "-r", "--reverse",
         metavar="PORTS",
-        help="Comma-separated ports for reverse forwarding (e.g. 3000,8080).",
+        help="Comma-separated ports for reverse forwarding (e.g. 3000,8080 or 4000).",
     )
     parser.add_argument(
         "--ip",
@@ -187,15 +187,28 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Error: Port must be between 1 and 65535, got {args.port}.", file=sys.stderr)
         sys.exit(1)
 
-    # Validate reverse ports
-    reverse_ports: list[int] = []
+    # Parse reverse ports — each entry is "port" (same on both sides)
+    # or "device:host" for different ports. Single port like -r 4000 is fine.
+    reverse_ports: list[tuple[int, int]] = []
     if args.reverse:
         for tok in args.reverse.split(","):
             tok = tok.strip()
-            if not tok.isdigit() or not 1 <= int(tok) <= 65535:
-                print(f"Error: Invalid reverse port '{tok}'. Must be 1-65535.", file=sys.stderr)
-                sys.exit(1)
-            reverse_ports.append(int(tok))
+            if ":" in tok:
+                parts = tok.split(":", 1)
+                if not all(p.isdigit() for p in parts):
+                    print(f"Error: Invalid reverse port '{tok}'. Must be port or device:host.", file=sys.stderr)
+                    sys.exit(1)
+                device_port, host_port = int(parts[0]), int(parts[1])
+            else:
+                if not tok.isdigit():
+                    print(f"Error: Invalid reverse port '{tok}'. Must be 1-65535.", file=sys.stderr)
+                    sys.exit(1)
+                device_port = host_port = int(tok)
+            for p in (device_port, host_port):
+                if not 1 <= p <= 65535:
+                    print(f"Error: Port {p} out of range. Must be 1-65535.", file=sys.stderr)
+                    sys.exit(1)
+            reverse_ports.append((device_port, host_port))
 
     # Check adb available
     if not shutil.which("adb"):
@@ -215,26 +228,57 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.ip:
         ip = args.ip
+        target = f"{ip}:{args.port}"
     else:
         usb_devices, wireless_targets = _parse_devices()
-        if not usb_devices:
-            print("Error: No USB devices found. Connect a device and enable USB debugging.", file=sys.stderr)
+
+        if usb_devices:
+            serial, device_name = _select_device(usb_devices)
+
+            # Get IP before switching to tcpip mode
+            ip = _get_device_ip(serial)
+            target = f"{ip}:{args.port}"
+
+            # Check if this device is already connected wirelessly
+            if target in wireless_targets:
+                already_connected = True
+        elif wireless_targets:
+            # No USB but already connected wirelessly — pick the wireless target
+            targets = sorted(wireless_targets)
+            if len(targets) == 1:
+                target = targets[0]
+                device_name = _get_device_name(target)
+            else:
+                names: dict[str, str] = {}
+                for t in targets:
+                    names[t] = _get_device_name(t)
+                print("Multiple wireless devices found:\n")
+                for i, t in enumerate(targets, 1):
+                    print(f"  {i}. {names[t]} ({t})")
+                print()
+                while True:
+                    try:
+                        choice = input(f"Select device (1-{len(targets)}): ")
+                    except (EOFError, KeyboardInterrupt):
+                        print(file=sys.stderr)
+                        sys.exit(1)
+                    if choice.isdigit() and 1 <= int(choice) <= len(targets):
+                        target = targets[int(choice) - 1]
+                        device_name = names[target]
+                        break
+                    print(f"Invalid selection. Enter a number between 1 and {len(targets)}.")
+            already_connected = True
+        else:
+            print("Error: No devices found. Connect a device and enable USB debugging.", file=sys.stderr)
             sys.exit(1)
 
-        serial, device_name = _select_device(usb_devices)
-
-        # Get IP before switching to tcpip mode
-        ip = _get_device_ip(serial)
-        target = f"{ip}:{args.port}"
-
-        # Check if this device is already connected wirelessly
-        if target in wireless_targets:
-            already_connected = True
-
-    target = f"{ip}:{args.port}"
-
     if already_connected:
-        print(f"Already connected to {device_name} at {target}")
+        # Only print status when running bare (no action flags)
+        if not reverse_ports:
+            if device_name:
+                print(f"Already connected to {device_name} at {target}")
+            else:
+                print(f"Already connected at {target}")
     else:
         if device_name:
             print(f"Setting up wireless ADB on {device_name} port {args.port}")
@@ -257,11 +301,12 @@ def main(argv: list[str] | None = None) -> None:
 
     # Reverse port forwarding
     if reverse_ports:
-        print(f"Setting up reverse forwarding on ports {reverse_ports}")
-        for rp in reverse_ports:
-            r = _run_adb("reverse", f"tcp:{rp}", f"tcp:{rp}", serial=target)
+        port_strs = [str(dp) if dp == hp else f"{dp}:{hp}" for dp, hp in reverse_ports]
+        print(f"Setting up reverse forwarding on ports {', '.join(port_strs)}")
+        for device_port, host_port in reverse_ports:
+            r = _run_adb("reverse", f"tcp:{device_port}", f"tcp:{host_port}", serial=target)
             if r.returncode != 0:
-                print(f"Warning: Failed to reverse port {rp}.", file=sys.stderr)
+                print(f"Warning: Failed to reverse port {device_port}.", file=sys.stderr)
 
     if not already_connected and not args.ip:
         print("You can now disconnect the USB cable.")
