@@ -155,7 +155,7 @@ def _get_device_ip(serial: str) -> str:
     sys.exit(1)
 
 
-def _connect(ip: str, port: int) -> None:
+def _connect(ip: str, port: int, *, enable_recovery: bool = False) -> None:
     """Connect to device wirelessly with retries."""
     target = f"{ip}:{port}"
     print(f"Connecting to {target}...")
@@ -174,6 +174,28 @@ def _connect(ip: str, port: int) -> None:
         if time.monotonic() >= deadline:
             break
         time.sleep(0.5)
+
+    if enable_recovery:
+        print("Connection failed, restarting ADB server and retrying...")
+        _run_adb("kill-server")
+        time.sleep(1)
+        _run_adb("start-server")
+        _run_adb("tcpip", str(port))
+        time.sleep(2)
+
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                r = _run_adb("connect", target, timeout=3)
+                last_output = (r.stdout + r.stderr).strip()
+                if "connected to" in last_output or "already connected" in last_output:
+                    return
+            except subprocess.TimeoutExpired:
+                last_output = "connection timed out"
+
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.5)
 
     print(f"Error: Failed to connect to {target}: {last_output}", file=sys.stderr)
     sys.exit(1)
@@ -292,7 +314,7 @@ def main(argv: list[str] | None = None) -> None:
                 sys.exit(1)
 
         # Connect wirelessly
-        _connect(ip, args.port)
+        _connect(ip, args.port, enable_recovery=not args.ip)
 
         if device_name:
             print(f"Connected to {device_name} at {target}")
