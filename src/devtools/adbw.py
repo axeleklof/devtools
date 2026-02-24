@@ -21,7 +21,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  adbw                          # basic wireless setup\n"
             "  adbw -p 5556                  # custom port\n"
             "  adbw -r 3000,8080             # with reverse port forwarding\n"
-            "  adbw --ip 192.168.1.42        # reconnect without USB"
+            "  adbw --ip 192.168.1.42        # reconnect without USB\n"
+            "  adbw -l                        # list devices and reversed ports"
         ),
     )
     parser.add_argument(
@@ -35,6 +36,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-r", "--reverse",
         metavar="PORTS",
         help="Comma-separated ports for reverse forwarding (e.g. 3000,8080 or 4000).",
+    )
+    parser.add_argument(
+        "-l", "--list",
+        action="store_true",
+        help="List connected devices and their reversed ports.",
     )
     parser.add_argument(
         "--ip",
@@ -201,8 +207,51 @@ def _connect(ip: str, port: int, *, enable_recovery: bool = False) -> None:
     sys.exit(1)
 
 
+def _list_devices() -> None:
+    """List connected devices and their reversed ports."""
+    usb_devices, wireless_targets = _parse_devices()
+    all_devices = usb_devices + sorted(wireless_targets)
+
+    if not all_devices:
+        print("No connected devices.")
+        return
+
+    for serial in all_devices:
+        name = _get_device_name(serial)
+        kind = "wireless" if ":" in serial else "usb"
+        print(f"{name} ({serial}) [{kind}]")
+
+        try:
+            r = _run_adb("reverse", "--list", serial=serial, timeout=5)
+            if r.returncode == 0 and r.stdout.strip():
+                for line in r.stdout.strip().splitlines():
+                    # format: "<serial> tcp:<device_port> tcp:<host_port>"
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        device_side = parts[1].removeprefix("tcp:")
+                        host_side = parts[2].removeprefix("tcp:")
+                        if device_side == host_side:
+                            print(f"  reverse tcp:{device_side}")
+                        else:
+                            print(f"  reverse tcp:{device_side} -> tcp:{host_side}")
+                    else:
+                        print(f"  {line.strip()}")
+            else:
+                print("  no reversed ports")
+        except subprocess.TimeoutExpired:
+            print("  (timed out querying reversed ports)")
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+
+    # List devices and exit
+    if args.list:
+        if not shutil.which("adb"):
+            print("Error: adb not found. Install Android SDK platform-tools.", file=sys.stderr)
+            sys.exit(1)
+        _list_devices()
+        return
 
     # Validate port
     if not 1 <= args.port <= 65535:
