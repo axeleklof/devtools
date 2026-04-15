@@ -161,7 +161,7 @@ def _get_device_ip(serial: str) -> str:
     sys.exit(1)
 
 
-def _connect(ip: str, port: int, *, enable_recovery: bool = False) -> None:
+def _connect(ip: str, port: int, *, enable_recovery: bool = False, usb_serial: str | None = None) -> None:
     """Connect to device wirelessly with retries."""
     target = f"{ip}:{port}"
     print(f"Connecting to {target}...")
@@ -186,7 +186,8 @@ def _connect(ip: str, port: int, *, enable_recovery: bool = False) -> None:
         _run_adb("kill-server")
         time.sleep(1)
         _run_adb("start-server")
-        _run_adb("tcpip", str(port))
+        if usb_serial:
+            _run_adb("tcpip", str(port))
         time.sleep(2)
 
         deadline = time.monotonic() + 5.0
@@ -363,7 +364,8 @@ def main(argv: list[str] | None = None) -> None:
                 sys.exit(1)
 
         # Connect wirelessly
-        _connect(ip, args.port, enable_recovery=not args.ip)
+        usb_serial = None if args.ip else serial
+        _connect(ip, args.port, enable_recovery=True, usb_serial=usb_serial)
 
         if device_name:
             print(f"Connected to {device_name} at {target}")
