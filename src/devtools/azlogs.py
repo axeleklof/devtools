@@ -4,17 +4,16 @@ import argparse
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
-import signal
 import tempfile
 import threading
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
-
 
 _BLOB_PATTERN = re.compile(r"^.+\.(\d{4}-\d{2}-\d{2})\.log$")
 
@@ -26,34 +25,24 @@ _INLINE_KEY_RE = re.compile(rb"\| \[ ([A-Z][A-Z_]*) \]:")
 _TIMESTAMP_RE = re.compile(rb" ?\[(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})\]")
 
 _RESET = b"\033[0m"
-_TIMESTAMP_COLOR = b"\033[2;33m"   # dim yellow
+_TIMESTAMP_COLOR = b"\033[2;33m"  # dim yellow
 
 _LEVEL_COLORS: dict[bytes, bytes] = {
-    b"ERROR":   b"\033[91m",   # bright red
-    b"WARN":    b"\033[93m",   # bright yellow
-    b"WARNING": b"\033[93m",   # bright yellow
-    b"INFO":    b"\033[96m",   # bright cyan
-    b"DEBUG":   b"\033[2m",    # dim
-    b"TRACE":   b"\033[2m",    # dim
+    b"ERROR": b"\033[91m",  # bright red
+    b"WARN": b"\033[93m",  # bright yellow
+    b"WARNING": b"\033[93m",  # bright yellow
+    b"INFO": b"\033[96m",  # bright cyan
+    b"DEBUG": b"\033[2m",  # dim
+    b"TRACE": b"\033[2m",  # dim
 }
 _KEY_COLORS: dict[bytes, bytes] = {
-    b"QUERY": b"\033[94m",   # bright blue
-    b"USER":  b"\033[95m",   # bright magenta
+    b"QUERY": b"\033[94m",  # bright blue
+    b"USER": b"\033[95m",  # bright magenta
 }
-_DEFAULT_LEVEL_COLOR = b"\033[36m"   # cyan for unrecognized levels
-_DEFAULT_KEY_COLOR   = b"\033[33m"   # yellow for unrecognized keys
+_DEFAULT_LEVEL_COLOR = b"\033[36m"  # cyan for unrecognized levels
+_DEFAULT_KEY_COLOR = b"\033[33m"  # yellow for unrecognized keys
 _POLL_INTERVAL = 5.0
 
-
-def _less_version() -> int:
-    try:
-        result = subprocess.run(["less", "--version"], capture_output=True, text=True)
-        return int(result.stdout.split()[1].split(".")[0])
-    except Exception:
-        return 0
-
-
-_LESS_SUPPORTS_HEADER = _less_version() >= 590
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -89,7 +78,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="fuzzy customer name — skips both pickers and opens today's log",
     )
     parser.add_argument(
-        "-f", "--follow",
+        "-f",
+        "--follow",
         nargs="?",
         const=_POLL_INTERVAL,
         default=None,
@@ -104,7 +94,9 @@ def _check_deps() -> None:
     missing = [tool for tool in ("fzf",) if not shutil.which(tool)]
     if missing:
         for tool in missing:
-            print(f"Error: '{tool}' not found. Install it and try again.", file=sys.stderr)
+            print(
+                f"Error: '{tool}' not found. Install it and try again.", file=sys.stderr
+            )
         sys.exit(1)
 
 
@@ -175,18 +167,13 @@ def _fzf_select(items: list[str], prompt: str, query: str = "") -> str:
     cmd = ["fzf", "--prompt", prompt, "--height", "40%", "--layout", "reverse"]
     if query:
         cmd += ["--query", query]
-    result = subprocess.run(cmd, input="\n".join(items), text=True, stdout=subprocess.PIPE)
+    result = subprocess.run(
+        cmd, input="\n".join(items), text=True, stdout=subprocess.PIPE
+    )
     if result.returncode != 0:
         sys.exit(0)
     return result.stdout.strip()
 
-
-def _header_line(customer: str, date_str: str, status: str = "") -> bytes:
-    text = f"  LOG: {customer}  |  {date_str}"
-    if status:
-        text += f"  |  {status}"
-    text += "  "
-    return b"\033[1;7m" + text.encode() + b"\033[0m\n"
 
 
 def _colorize_line(line: bytes) -> bytes:
@@ -245,7 +232,9 @@ def _stream_to_dest(url: str, dest) -> int:
     return raw_bytes
 
 
-def _poll_log(url: str, tmp: Path, offset: list[int], stop: threading.Event, interval: float) -> None:
+def _poll_log(
+    url: str, tmp: Path, offset: list[int], stop: threading.Event, interval: float
+) -> None:
     """Background thread: append new bytes from Azure to tmp every interval seconds."""
     while not stop.wait(interval):
         try:
@@ -270,12 +259,8 @@ def _poll_log(url: str, tmp: Path, offset: list[int], stop: threading.Event, int
 def _open_log(url: str, customer: str, date_str: str) -> None:
     prompt = f"LOG: {customer}  {date_str} -- line %l"
     less_cmd = ["less", "-RNS", "+G", f"-Ps{prompt}"]
-    if _LESS_SUPPORTS_HEADER:
-        less_cmd += ["--header=1"]
     less_proc = subprocess.Popen(less_cmd, stdin=subprocess.PIPE)
     try:
-        if _LESS_SUPPORTS_HEADER:
-            less_proc.stdin.write(_header_line(customer, date_str, f"fetched: {datetime.now().strftime('%H:%M:%S')}"))  # type: ignore[union-attr]
         _stream_to_dest(url, less_proc.stdin)
     finally:
         try:
@@ -292,8 +277,6 @@ def _follow_log(url: str, customer: str, date_str: str, interval: float) -> None
 
     try:
         with tmp.open("wb") as f:
-            if _LESS_SUPPORTS_HEADER:
-                f.write(_header_line(customer, date_str, "follow mode"))
             raw_size = _stream_to_dest(url, f)
 
         offset = [raw_size]
@@ -306,8 +289,6 @@ def _follow_log(url: str, customer: str, date_str: str, interval: float) -> None
 
         prompt = f"LOG: {customer}  {date_str} [follow] -- line %l"
         less_cmd = ["less", "-RNS", "+GF", f"-Ps{prompt}", str(tmp)]
-        if _LESS_SUPPORTS_HEADER:
-            less_cmd.insert(1, "--header=1")
         # Ignore SIGINT in Python so Ctrl+C only reaches less (exits follow mode)
         # rather than killing this process. User can then scroll freely and press
         # F to resume follow mode, or q to quit.
@@ -328,7 +309,10 @@ def main(argv: list[str] | None = None) -> None:
     base_url = os.environ.get("AZURE_BLOB_BASE_URL", "").rstrip("/")
     sas_token = os.environ.get("AZURE_SAS_TOKEN", "")
     if not base_url or not sas_token:
-        for v, val in (("AZURE_BLOB_BASE_URL", base_url), ("AZURE_SAS_TOKEN", sas_token)):
+        for v, val in (
+            ("AZURE_BLOB_BASE_URL", base_url),
+            ("AZURE_SAS_TOKEN", sas_token),
+        ):
             if not val:
                 print(f"Error: ${v} is not set.", file=sys.stderr)
         sys.exit(1)
@@ -350,7 +334,10 @@ def main(argv: list[str] | None = None) -> None:
         today = date.today().isoformat()
         today_blobs = [b for b in blobs if today in b]
         if not today_blobs:
-            print(f"Error: No log for today ({today}) found in '{container}'.", file=sys.stderr)
+            print(
+                f"Error: No log for today ({today}) found in '{container}'.",
+                file=sys.stderr,
+            )
             sys.exit(1)
         blob_name = today_blobs[0]
         m = _BLOB_PATTERN.match(blob_name)
@@ -360,7 +347,10 @@ def main(argv: list[str] | None = None) -> None:
         container = customer + "logs"
         blobs = _list_blobs(base_url, sas_token, container)
         if not blobs:
-            print(f"Error: No log files found in '{container}' for the past 14 days.", file=sys.stderr)
+            print(
+                f"Error: No log files found in '{container}' for the past 14 days.",
+                file=sys.stderr,
+            )
             sys.exit(1)
         today = date.today().isoformat()
         blob_name = _fzf_select(blobs, "log> ", query=today)
