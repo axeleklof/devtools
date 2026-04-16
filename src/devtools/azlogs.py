@@ -77,6 +77,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="fuzzy customer name — skips both pickers and opens today's log",
     )
     parser.add_argument(
+        "--mouse",
+        action="store_true",
+        help="enable mouse scrolling in less (disables text selection without holding Option)",
+    )
+    parser.add_argument(
         "-f",
         "--follow",
         nargs="?",
@@ -266,10 +271,12 @@ def _poll_log(
             pass  # never crash the background thread
 
 
-def _open_log(url: str, customer: str, date_str: str) -> None:
+def _open_log(url: str, customer: str, date_str: str, mouse: bool = False) -> None:
     fetched = datetime.now().strftime("%H:%M:%S")
     banner = _banner_line(customer, date_str, f"fetched {fetched}")
-    less_cmd = ["less", "-RINSs", "+G"]
+    less_cmd = ["less", "-RINSs", "--incsearch", "-M", "-j.5", "+G"]
+    if mouse:
+        less_cmd.append("--mouse")
     less_proc = subprocess.Popen(less_cmd, stdin=subprocess.PIPE)
     try:
         less_proc.stdin.write(banner)  # type: ignore[union-attr]
@@ -284,7 +291,7 @@ def _open_log(url: str, customer: str, date_str: str) -> None:
     less_proc.wait()
 
 
-def _follow_log(url: str, customer: str, date_str: str, interval: float) -> None:
+def _follow_log(url: str, customer: str, date_str: str, interval: float, mouse: bool = False) -> None:
     tmp = Path(tempfile.mktemp(prefix="azlogs_", suffix=".log"))
     stop = threading.Event()
 
@@ -302,7 +309,9 @@ def _follow_log(url: str, customer: str, date_str: str, interval: float) -> None
         )
         thread.start()
 
-        less_cmd = ["less", "-RINSs", "+GF", str(tmp)]
+        less_cmd = ["less", "-RINSs", "--incsearch", "-M", "-j.5", "+GF", str(tmp)]
+        if mouse:
+            less_cmd.insert(1, "--mouse")
         # Ignore SIGINT in Python so Ctrl+C only reaches less (exits follow mode)
         # rather than killing this process. User can then scroll freely and press
         # F to resume follow mode, or q to quit.
@@ -375,6 +384,6 @@ def main(argv: list[str] | None = None) -> None:
     customer_display = _strip_logs(container)
 
     if args.follow is not None:
-        _follow_log(url, customer_display, date_str, interval=args.follow)
+        _follow_log(url, customer_display, date_str, interval=args.follow, mouse=args.mouse)
     else:
-        _open_log(url, customer_display, date_str)
+        _open_log(url, customer_display, date_str, mouse=args.mouse)
