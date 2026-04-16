@@ -12,7 +12,7 @@ import threading
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 _BLOB_PATTERN = re.compile(r"^.+\.(\d{4}-\d{2}-\d{2})\.log$")
@@ -42,7 +42,6 @@ _KEY_COLORS: dict[bytes, bytes] = {
 _DEFAULT_LEVEL_COLOR = b"\033[36m"  # cyan for unrecognized levels
 _DEFAULT_KEY_COLOR = b"\033[33m"  # yellow for unrecognized keys
 _POLL_INTERVAL = 5.0
-
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -175,6 +174,17 @@ def _fzf_select(items: list[str], prompt: str, query: str = "") -> str:
     return result.stdout.strip()
 
 
+def _banner_line(customer: str, date_str: str, label: str = "") -> bytes:
+    text = f" {customer} · {date_str}"
+    if label:
+        text += f" · {label}"
+    text += " "
+    width = shutil.get_terminal_size().columns
+    fill = max(0, width - len(text))
+    left = max(fill // 2 - 20, 0)
+    line = "─" * left + text + "─" * (fill - left)
+    return b"\033[2;37m" + line.encode() + b"\033[0m\n"
+
 
 def _colorize_line(line: bytes) -> bytes:
     # Extract and strip timestamp, keep only HH:MM:SS for the prefix
@@ -257,11 +267,14 @@ def _poll_log(
 
 
 def _open_log(url: str, customer: str, date_str: str) -> None:
-    prompt = f"LOG: {customer}  {date_str} -- line %l"
-    less_cmd = ["less", "-RNS", "+G", f"-Ps{prompt}"]
+    fetched = datetime.now().strftime("%H:%M:%S")
+    banner = _banner_line(customer, date_str, f"fetched {fetched}")
+    less_cmd = ["less", "-RINSs", "+G"]
     less_proc = subprocess.Popen(less_cmd, stdin=subprocess.PIPE)
     try:
+        less_proc.stdin.write(banner)  # type: ignore[union-attr]
         _stream_to_dest(url, less_proc.stdin)
+        less_proc.stdin.write(b"\n" + banner)  # type: ignore[union-attr]
     finally:
         try:
             if less_proc.stdin:
@@ -276,7 +289,9 @@ def _follow_log(url: str, customer: str, date_str: str, interval: float) -> None
     stop = threading.Event()
 
     try:
+        banner = _banner_line(customer, date_str, "follow")
         with tmp.open("wb") as f:
+            f.write(banner)
             raw_size = _stream_to_dest(url, f)
 
         offset = [raw_size]
@@ -287,8 +302,7 @@ def _follow_log(url: str, customer: str, date_str: str, interval: float) -> None
         )
         thread.start()
 
-        prompt = f"LOG: {customer}  {date_str} [follow] -- line %l"
-        less_cmd = ["less", "-RNS", "+GF", f"-Ps{prompt}", str(tmp)]
+        less_cmd = ["less", "-RINSs", "+GF", str(tmp)]
         # Ignore SIGINT in Python so Ctrl+C only reaches less (exits follow mode)
         # rather than killing this process. User can then scroll freely and press
         # F to resume follow mode, or q to quit.
