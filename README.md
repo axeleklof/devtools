@@ -12,7 +12,7 @@ Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
 uv tool install git+https://github.com/axeleklof/devtools.git
 ```
 
-This makes `adbshot` and `adbw` available globally on your PATH. To update later:
+This makes `adbshot`, `adbw`, and `azlogs` available globally on your PATH. To update later:
 
 ```bash
 uv tool upgrade devtools
@@ -63,3 +63,27 @@ adbw -p 5556                  # custom port
 adbw -r 3000,8080             # with reverse port forwarding
 adbw --ip 192.168.1.42        # reconnect without USB
 ```
+
+### azlogs
+
+Browse and view Azure Blob Storage log files. Uses `fzf` for interactive selection and `less` for viewing.
+
+Assumes:
+- Containers are named `{customer}logs` — only containers whose name contains `logs` are listed
+- Log blobs follow the pattern `{prefix}.YYYY-MM-DD.log`
+- The SAS token has container list (enumeration) and blob read permissions
+
+```bash
+azlogs                        # pick customer and date interactively
+azlogs river                  # open today's log for the best-matching customer
+azlogs river -f               # follow mode: poll for new lines every 5s
+azlogs river -f 10            # follow mode with 10s poll interval
+```
+
+Required environment variables (e.g. in `.zshrc.local`):
+```bash
+export AZURE_BLOB_BASE_URL=https://example.blob.core.windows.net/
+export AZURE_SAS_TOKEN=sv=2021-...&sig=...
+```
+
+Navigation: `j`/`k` to scroll, `/` to search, `←`/`→` for long lines, `Ctrl+C` to pause follow mode, `F` to resume, `q` to quit.

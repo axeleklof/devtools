@@ -8,6 +8,7 @@ dependencies = []
 [project.scripts]
 adbshot = "devtools.adbshot:main"
 adbw = "devtools.adbw:main"
+azlogs = "devtools.azlogs:main"
 
 [build-system]
 requires = ["hatchling"]
