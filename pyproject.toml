@@ -9,6 +9,7 @@ dependencies = []
 adbshot = "devtools.adbshot:main"
 adbw = "devtools.adbw:main"
 azlogs = "devtools.azlogs:main"
+oneshot = "devtools.oneshot:main"
 
 [build-system]
 requires = ["hatchling"]
