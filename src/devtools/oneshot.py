@@ -11,7 +11,16 @@ import subprocess
 import sys
 import urllib.request
 from datetime import date
+from pathlib import Path
 
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib  # type: ignore[no-redef]
+
+
+_CONFIG_PATH = Path.home() / ".config" / "oneshot" / "config.toml"
+_STDIN_LIMIT = 32 * 1024  # 32 KB
 
 # Tools that are useful when available but should not override standard choices.
 _POWER_TOOLS = [
@@ -24,6 +33,10 @@ _POWER_TOOLS = [
 
 _RUNTIMES = ["python3", "node", "go", "ruby", "bun"]
 
+
+# ---------------------------------------------------------------------------
+# Context detection
+# ---------------------------------------------------------------------------
 
 def _detect_tools() -> str:
     found = [t for t in _POWER_TOOLS if shutil.which(t)]
@@ -39,10 +52,8 @@ def _detect_runtimes() -> str:
             out = subprocess.check_output(
                 [rt, "--version"], stderr=subprocess.STDOUT, timeout=2, text=True
             ).strip().splitlines()[0]
-            # Extract just the version number — e.g. "Python 3.13.0" → "python 3.13"
             tokens = out.split()
             version = tokens[-1] if tokens else ""
-            # Trim to major.minor
             parts_v = version.lstrip("v").split(".")
             short = ".".join(parts_v[:2]) if len(parts_v) >= 2 else version
             parts.append(f"{rt.replace('python3', 'python')} {short}")
@@ -74,7 +85,6 @@ def _build_context() -> str:
         shell_ver = subprocess.check_output(
             [shell, "--version"], stderr=subprocess.STDOUT, timeout=2, text=True
         ).strip().splitlines()[0]
-        # e.g. "zsh 5.9 (x86_64-apple-darwin23.0)" → "zsh 5.9"
         shell_str = " ".join(shell_ver.split()[:2])
     except Exception:
         shell_str = shell_name
@@ -101,6 +111,68 @@ def _build_context() -> str:
 
     return "\n".join(lines)
 
+
+# ---------------------------------------------------------------------------
+# Config / API resolution
+# ---------------------------------------------------------------------------
+
+def _load_config() -> dict:
+    if not _CONFIG_PATH.exists():
+        return {}
+    try:
+        with open(_CONFIG_PATH, "rb") as f:
+            return tomllib.load(f)
+    except Exception as e:
+        print(f"oneshot: warning: could not read config: {e}", file=sys.stderr)
+        return {}
+
+
+def _resolve_api_config(profile: str | None) -> tuple[str, str, str]:
+    """Return (api_key, api_url, model) by applying priority order."""
+    config = _load_config()
+
+    # Determine which profile to use
+    if profile is None:
+        profile = config.get("default", {}).get("profile")
+
+    profile_data: dict = {}
+    if profile:
+        profile_data = config.get("profiles", {}).get(profile, {})
+        if not profile_data and profile:
+            print(f"oneshot: warning: profile '{profile}' not found in config", file=sys.stderr)
+
+    def _from_profile(key: str) -> str | None:
+        env_var = profile_data.get(f"{key}_env")
+        if env_var:
+            return os.environ.get(env_var)
+        return profile_data.get(key)
+
+    # Priority: env vars > profile > hardcoded defaults
+    api_key = (
+        os.environ.get("ONESHOT_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or _from_profile("api_key")
+    )
+    api_url = (
+        os.environ.get("ONESHOT_API_URL")
+        or _from_profile("api_url")
+        or "https://api.openai.com/v1/chat/completions"
+    )
+    model = (
+        os.environ.get("ONESHOT_MODEL")
+        or _from_profile("model")
+        or "gpt-4o-mini"
+    )
+
+    if not api_key:
+        sys.exit("oneshot: no API key found — set ONESHOT_API_KEY or configure a profile in ~/.config/oneshot/config.toml")
+
+    return api_key, api_url, model
+
+
+# ---------------------------------------------------------------------------
+# System prompts
+# ---------------------------------------------------------------------------
 
 _SYSTEM_CMD = """\
 You are a terminal assistant. The user will ask a question about how to do something.
@@ -152,14 +224,11 @@ def _get_system_prompt(mode: str, verbose: bool) -> str:
     return _SYSTEM_CMD.format(context=context)
 
 
-def _call_api(system: str, user: str) -> str:
-    api_key = os.environ.get("ONESHOT_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    api_url = os.environ.get("ONESHOT_API_URL", "https://api.openai.com/v1/chat/completions")
-    model = os.environ.get("ONESHOT_MODEL", "gpt-4o-mini")
+# ---------------------------------------------------------------------------
+# API call
+# ---------------------------------------------------------------------------
 
-    if not api_key:
-        sys.exit("oneshot: ONESHOT_API_KEY (or OPENAI_API_KEY) is not set")
-
+def _call_api(system: str, user: str, api_key: str, api_url: str, model: str) -> str:
     payload = json.dumps({
         "model": model,
         "messages": [
@@ -191,6 +260,10 @@ def _call_api(system: str, user: str) -> str:
     return data["choices"][0]["message"]["content"].strip()
 
 
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
 def _extract_code_block(text: str) -> str | None:
     """Return the content of the first fenced code block, or None."""
     lines = text.splitlines()
@@ -215,6 +288,24 @@ def _copy_to_clipboard(text: str) -> None:
         pass  # clipboard failure is non-fatal
 
 
+def _read_stdin() -> str | None:
+    """Read piped stdin, capped at _STDIN_LIMIT. Returns None if stdin is a TTY."""
+    if sys.stdin.isatty():
+        return None
+    raw = sys.stdin.buffer.read(_STDIN_LIMIT + 1)
+    if len(raw) > _STDIN_LIMIT:
+        print(
+            f"oneshot: warning: stdin truncated to {_STDIN_LIMIT // 1024} KB",
+            file=sys.stderr,
+        )
+        raw = raw[:_STDIN_LIMIT]
+    return raw.decode(errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="oneshot",
@@ -224,15 +315,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Modes:\n"
             "  default / -c   Return a shell command (copied to clipboard)\n"
             "  -x             Return a markdown explanation\n\n"
-            "Environment variables:\n"
+            "Config file: ~/.config/oneshot/config.toml\n\n"
+            "Environment variables (override config):\n"
             "  ONESHOT_API_KEY   API key (falls back to OPENAI_API_KEY)\n"
-            "  ONESHOT_API_URL   API endpoint (default: OpenAI)\n"
-            "  ONESHOT_MODEL     Model name (default: gpt-4o-mini)\n\n"
+            "  ONESHOT_API_URL   API endpoint\n"
+            "  ONESHOT_MODEL     Model name\n\n"
             "Examples:\n"
             "  oneshot \"find all files modified in the last 24 hours\"\n"
             "  oneshot -v \"find all files modified in the last 24 hours\"\n"
-            "  oneshot -x \"what is a semaphore\"\n"
             "  oneshot -x \"what is a semaphore\" | glow\n"
+            "  oneshot -p local \"list processes on port 8080\"\n"
+            "  cat error.log | oneshot \"what's wrong here\"\n"
+            "  git diff | oneshot -v \"summarise these changes\"\n"
         ),
     )
     parser.add_argument("query", help="Your question")
@@ -253,6 +347,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="(Command mode) include a brief explanation before the command",
     )
     parser.add_argument(
+        "-p", "--profile",
+        metavar="NAME",
+        help="Use a named profile from ~/.config/oneshot/config.toml",
+    )
+    parser.add_argument(
         "--no-clip",
         action="store_true",
         help="Do not copy command to clipboard",
@@ -263,9 +362,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
+    stdin_content = _read_stdin()
+    user_message = args.query
+    if stdin_content:
+        user_message = f"{args.query}\n\n---\n{stdin_content}"
+
     mode = "explain" if args.explain else "cmd"
     system = _get_system_prompt(mode, verbose=args.verbose)
-    response = _call_api(system, args.query)
+    api_key, api_url, model = _resolve_api_config(args.profile)
+    response = _call_api(system, user_message, api_key, api_url, model)
 
     if mode == "cmd":
         command = _extract_code_block(response)
@@ -273,14 +378,12 @@ def main(argv: list[str] | None = None) -> None:
             if not args.no_clip:
                 _copy_to_clipboard(command)
             if args.verbose:
-                # Print full response but highlight that the command is in clipboard
                 print(response)
                 print("\n\x1b[2m(command copied to clipboard)\x1b[0m")
             else:
                 print(command)
                 print("\x1b[2m(copied to clipboard)\x1b[0m", file=sys.stderr)
         else:
-            # Model didn't return a code block — print raw and don't claim clipboard
             print(response)
     else:
         print(response)
