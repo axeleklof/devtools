@@ -12,7 +12,7 @@ Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
 uv tool install git+https://github.com/axeleklof/devtools.git
 ```
 
-This makes `adbshot`, `adbw`, and `azlogs` available globally on your PATH. To update later:
+This makes `adbshot`, `adbw`, `azlogs`, and `oneshot` available globally on your PATH. To update later:
 
 ```bash
 uv tool upgrade devtools
@@ -87,3 +87,73 @@ export AZURE_SAS_TOKEN=sv=2021-...&sig=...
 ```
 
 Navigation: `j`/`k` to scroll, `/` to search, `←`/`→` for long lines, `Ctrl+C` to pause follow mode, `F` to resume, `q` to quit.
+
+### oneshot
+
+One-shot LLM query from the terminal — get a shell command or a quick explanation without leaving your workflow.
+
+```bash
+oneshot "find files modified in the last 24 hours"       # command mode (default)
+oneshot -v "find files modified in the last 24 hours"    # command + brief explanation
+oneshot -x "what is a semaphore"                         # explanation as markdown
+oneshot -x "what is a semaphore" | glow                  # render with glow
+oneshot -p local "list processes on port 8080"           # use a named profile
+cat error.log | oneshot "what's wrong here"              # pipe content as context
+git diff | oneshot -v "summarise these changes"
+```
+
+In command mode the command is automatically copied to your clipboard. Useful aliases:
+
+```bash
+alias osc='oneshot'
+ose() { oneshot -x "$@" | glow -; }   # explain, rendered
+osv() { oneshot -v "$@" | glow -; }   # command + explanation, rendered
+```
+
+#### Configuration
+
+Create `~/.config/oneshot/config.toml` to define named profiles. The `[default]` section sets which profile is active when no `-p` flag is given.
+
+```toml
+[default]
+profile = "deepseek"
+
+[profiles.deepseek]
+api_url = "https://api.deepseek.com/v1/chat/completions"
+model = "deepseek-chat"
+api_key = "sk-..."
+
+[profiles.local]
+api_url = "http://localhost:11434/v1/chat/completions"
+model = "llama3.2"
+api_key = "ollama"
+```
+
+If you'd rather not store keys in the config file, use `api_key_env` to reference an environment variable instead:
+
+```toml
+[profiles.openai]
+api_url = "https://api.openai.com/v1/chat/completions"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+```
+
+**Priority order** (highest wins): `-p` CLI flag → `ONESHOT_API_KEY` / `ONESHOT_API_URL` / `ONESHOT_MODEL` env vars → config profile → hardcoded defaults (OpenAI, `gpt-4o-mini`).
+
+#### What is sent to the API
+
+Each request includes a system prompt with the following context collected at invocation time:
+
+| Field | Value | Example |
+|---|---|---|
+| OS | macOS version | `macOS 15.4` |
+| Shell | Name and version | `zsh 5.9` |
+| Working directory | Basename only (not full path) | `devtools` |
+| Git context | Whether cwd is inside a git repo | `in git repo` |
+| Date | Today's date | `2026-06-01` |
+| Installed tools | Presence check of ~15 common CLI tools | `fd, rg, jq, bat` |
+| Runtimes | Name and major.minor version | `python 3.13, node 22.1` |
+
+If you pipe content into `oneshot`, that content is included in the user message sent to the API. It is capped at 32 KB and a warning is printed if truncated.
+
+No shell history, environment variables, file contents, or full paths are ever sent.
