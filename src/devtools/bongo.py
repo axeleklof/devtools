@@ -327,9 +327,15 @@ def _cmd_ls(config: dict, args: argparse.Namespace) -> None:
 
     databases = _list_databases(cluster["uri"])
     print(f"{cluster_name} ({_redact_uri(cluster['uri'])})")
+    hidden = 0
     for db in sorted(databases, key=lambda d: d["name"]):
+        if db["name"] in _SYSTEM_DBS and not args.all:
+            hidden += 1
+            continue
         tag = "  [protected]" if _is_protected(config, cluster_name, db["name"]) else ""
         print(f"  {db['name']:<30} {_format_size(db['size']):>10}{tag}")
+    if hidden:
+        print(_c("2", f"  ({hidden} system databases hidden — use -a to show)"))
 
 
 _SYSTEM_DBS = {"admin", "config", "local"}
@@ -709,6 +715,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     ls = sub.add_parser("ls", help="list databases on a cluster")
     ls.add_argument("cluster", nargs="?", help="cluster name (defaults to the default cluster)")
+    ls.add_argument("-a", "--all", action="store_true", help="include system databases (admin, config, local)")
 
     prune = sub.add_parser("prune", help="interactively drop databases created by bongo")
     prune.add_argument("cluster", nargs="?", help="cluster name (defaults to the default cluster)")
