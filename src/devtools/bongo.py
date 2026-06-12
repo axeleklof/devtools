@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -67,14 +68,35 @@ def _get_cluster(config: dict, name: str) -> dict:
     return cluster
 
 
+def _git_branch_db() -> str:
+    """Return the current git branch name sanitized into a valid db name."""
+    try:
+        branch = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True, timeout=5,
+        ).strip()
+    except Exception:
+        sys.exit("bongo: '.' requires being inside a git repository")
+    if branch == "HEAD":
+        sys.exit("bongo: '.' cannot resolve a branch name (detached HEAD)")
+    db = re.sub(r"[^A-Za-z0-9_-]", "-", branch)[:63]
+    print(f"Resolved '.' -> '{db}' (branch {branch})")
+    return db
+
+
 def _resolve_address(config: dict, address: str) -> tuple[str, str]:
-    """Split 'cluster:db' (or bare 'db', using the default cluster) into (cluster, db)."""
+    """Split 'cluster:db' (or bare 'db', using the default cluster) into (cluster, db).
+
+    A db of '.' resolves to the current git branch name, sanitized.
+    """
     if ":" in address:
         cluster_name, db = address.split(":", 1)
     else:
         cluster_name, db = config.get("default", ""), address
         if not cluster_name:
             sys.exit(f"bongo: '{address}' has no cluster prefix and no default cluster is set in config")
+    if db == ".":
+        db = _git_branch_db()
     if not _DB_NAME_RE.match(db):
         sys.exit(f"bongo: invalid database name '{db}' (allowed: letters, digits, _ and -)")
     _get_cluster(config, cluster_name)
@@ -195,6 +217,37 @@ def _confirm(prompt: str) -> bool:
         return False
 
 
+def _pick(items: list[str], prompt: str) -> str | None:
+    """Let the user pick one item — via fzf when available, else a numbered list."""
+    if not items:
+        return None
+    if shutil.which("fzf"):
+        proc = subprocess.run(
+            ["fzf", "--prompt", f"{prompt} ", "--height", "40%", "--reverse"],
+            input="\n".join(items), stdout=subprocess.PIPE, text=True,
+        )
+        choice = proc.stdout.strip()
+        return choice or None
+    for i, item in enumerate(items, 1):
+        print(f"{i:3}) {item}")
+    try:
+        raw = input(f"{prompt} [1-{len(items)}] ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if raw.isdigit() and 1 <= int(raw) <= len(items):
+        return items[int(raw) - 1]
+    return None
+
+
+def _uri_with_db(uri: str, db: str) -> str:
+    """Insert a default database into a connection string, preserving query options."""
+    base, _, query = uri.partition("?")
+    scheme, _, rest = base.partition("://")
+    host = rest.split("/", 1)[0]
+    return f"{scheme}://{host}/{db}" + (f"?{query}" if query else "")
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -212,7 +265,23 @@ def _cmd_ls(config: dict, args: argparse.Namespace) -> None:
         print(f"  {db['name']:<30} {_format_size(db['size']):>10}{tag}")
 
 
+_SYSTEM_DBS = {"admin", "config", "local"}
+
+
 def _cmd_rm(config: dict, args: argparse.Namespace) -> None:
+    if args.database is None:
+        cluster_name = config.get("default")
+        if not cluster_name:
+            sys.exit("bongo: no database given and no default cluster is set in config")
+        uri = _get_cluster(config, cluster_name)["uri"]
+        choices = [
+            d["name"] for d in sorted(_list_databases(uri), key=lambda d: d["name"])
+            if d["name"] not in _SYSTEM_DBS and not _is_protected(config, cluster_name, d["name"])
+        ]
+        picked = _pick(choices, f"drop from {cluster_name}:")
+        if picked is None:
+            sys.exit("bongo: aborted")
+        args.database = f"{cluster_name}:{picked}"
     cluster_name, db = _resolve_address(config, args.database)
     cluster = config["clusters"][cluster_name]
 
@@ -352,6 +421,14 @@ def _parse_snapshot_filename(path: Path) -> tuple[str, str]:
 
 
 def _cmd_restore(config: dict, args: argparse.Namespace) -> None:
+    if args.database is None and not args.file:
+        names = [p.name for p in reversed(_snapshot_files())]
+        if not names:
+            sys.exit(f"bongo: no snapshots in {_SNAPSHOT_DIR}")
+        picked = _pick(names, "restore snapshot:")
+        if picked is None:
+            sys.exit("bongo: aborted")
+        args.file = str(_SNAPSHOT_DIR / picked)
     if args.file:
         path = Path(args.file).expanduser()
         if not path.exists():
@@ -391,6 +468,92 @@ def _cmd_restore(config: dict, args: argparse.Namespace) -> None:
     print(f"Done — '{dst_cluster_name}:{dst_db}' is ready")
 
 
+def _cmd_sh(config: dict, args: argparse.Namespace) -> None:
+    target = args.target
+    cluster_name, db = None, None
+    if target is None:
+        cluster_name = config.get("default")
+        if not cluster_name:
+            sys.exit("bongo: no target given and no default cluster is set in config")
+    elif ":" in target:
+        cluster_name, db = _resolve_address(config, target)
+    elif target in config["clusters"]:
+        cluster_name = target
+    else:
+        cluster_name, db = _resolve_address(config, target)
+
+    uri = _get_cluster(config, cluster_name)["uri"]
+    if db:
+        uri = _uri_with_db(uri, db)
+    print(f"Connecting to {cluster_name}" + (f":{db}" if db else "") + " ...")
+    os.execvp("mongosh", ["mongosh", uri])
+
+
+def _collection_stats(uri: str, db: str) -> dict[str, dict]:
+    """Return {collection: {count, indexes}} for a database."""
+    collections = _mongosh_json(
+        uri,
+        f"(() => {{ const d = db.getSiblingDB({json.dumps(db)});"
+        " return d.getCollectionNames().filter(c => !c.startsWith('system.'))"
+        ".map(c => ({name: c, count: d.getCollection(c).estimatedDocumentCount(),"
+        " indexes: d.getCollection(c).getIndexes().map(i => i.name).sort()})); })()",
+    )
+    return {c["name"]: c for c in collections}
+
+
+def _cmd_diff(config: dict, args: argparse.Namespace) -> None:
+    a_cluster, a_db = _resolve_address(config, args.a)
+    b_cluster, b_db = _resolve_address(config, args.b)
+    a_label, b_label = f"{a_cluster}:{a_db}", f"{b_cluster}:{b_db}"
+    a_uri = config["clusters"][a_cluster]["uri"]
+    b_uri = config["clusters"][b_cluster]["uri"]
+
+    for uri, cluster, db, label in ((a_uri, a_cluster, a_db, a_label), (b_uri, b_cluster, b_db, b_label)):
+        if not _db_exists(uri, db):
+            sys.exit(f"bongo: database '{db}' not found on cluster '{cluster}'")
+    a_stats = _collection_stats(a_uri, a_db)
+    b_stats = _collection_stats(b_uri, b_db)
+
+    only_a = sorted(set(a_stats) - set(b_stats))
+    only_b = sorted(set(b_stats) - set(a_stats))
+    changed: list[str] = []
+    identical = 0
+    for name in sorted(set(a_stats) & set(b_stats)):
+        a_c, b_c = a_stats[name], b_stats[name]
+        notes = []
+        if a_c["count"] != b_c["count"]:
+            notes.append(f"{a_c['count']:,} -> {b_c['count']:,} docs")
+        added = sorted(set(b_c["indexes"]) - set(a_c["indexes"]))
+        removed = sorted(set(a_c["indexes"]) - set(b_c["indexes"]))
+        if added:
+            notes.append("indexes +" + " +".join(added))
+        if removed:
+            notes.append("indexes -" + " -".join(removed))
+        if notes:
+            changed.append(f"  {name:<30} {', '.join(notes)}")
+        else:
+            identical += 1
+
+    print(f"{a_label} <-> {b_label}")
+    if not (only_a or only_b or changed):
+        print(f"No differences ({identical} collections compared)")
+        return
+    if only_a:
+        print(f"only in {a_label}:")
+        for name in only_a:
+            print(f"  {name:<30} {a_stats[name]['count']:,} docs")
+    if only_b:
+        print(f"only in {b_label}:")
+        for name in only_b:
+            print(f"  {name:<30} {b_stats[name]['count']:,} docs")
+    if changed:
+        print("changed:")
+        for line in changed:
+            print(line)
+    if identical:
+        print(f"{identical} collections identical")
+
+
 def _cmd_init(args: argparse.Namespace) -> None:
     if _CONFIG_PATH.exists():
         sys.exit(f"bongo: config already exists at {_CONFIG_PATH}")
@@ -414,7 +577,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "default cluster from ~/.config/bongo/config.toml.\n\n"
             "Examples:\n"
             "  bongo cp main pr-539              # copy within the default cluster\n"
+            "  bongo cp main .                   # '.' = current git branch name, sanitized\n"
             "  bongo cp atlas-dev:staging local:main\n"
+            "  bongo sh                          # mongosh shell on the default cluster\n"
+            "  bongo diff main pr-539            # collection/count/index differences\n"
             "  bongo ls                          # databases on the default cluster\n"
             "  bongo ls atlas-dev\n"
             "  bongo rm pr-539\n"
@@ -433,8 +599,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     cp.add_argument("-y", "--yes", action="store_true", help="skip the overwrite confirmation")
     cp.add_argument("--force", action="store_true", help="allow overwriting a protected database")
 
-    rm = sub.add_parser("rm", help="drop a database")
-    rm.add_argument("database", help="database to drop (<cluster>:<db> or <db>)")
+    rm = sub.add_parser("rm", help="drop a database (no arg: pick interactively)")
+    rm.add_argument("database", nargs="?", help="database to drop (<cluster>:<db> or <db>)")
     rm.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     rm.add_argument("--force", action="store_true", help="allow dropping a protected database")
 
@@ -449,12 +615,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     snapshot = sub.add_parser("snapshot", help="dump a database to a local archive (no arg: list snapshots)")
     snapshot.add_argument("database", nargs="?", help="database to snapshot (<cluster>:<db> or <db>)")
 
-    restore = sub.add_parser("restore", help="restore a database from its latest snapshot")
+    restore = sub.add_parser("restore", help="restore a database from its latest snapshot (no arg: pick interactively)")
     restore.add_argument("database", nargs="?", help="database whose snapshot to restore (<cluster>:<db> or <db>)")
     restore.add_argument("target", nargs="?", help="target database (defaults to restoring in place)")
     restore.add_argument("--file", metavar="PATH", help="restore a specific snapshot file instead of the latest")
     restore.add_argument("-y", "--yes", action="store_true", help="skip the overwrite confirmation")
     restore.add_argument("--force", action="store_true", help="allow overwriting a protected database")
+
+    sh = sub.add_parser("sh", help="open a mongosh shell on a configured cluster")
+    sh.add_argument("target", nargs="?", help="<cluster>, <cluster>:<db> or <db> (defaults to the default cluster)")
+
+    diff = sub.add_parser("diff", help="compare two databases (collections, doc counts, indexes)")
+    diff.add_argument("a", help="first database (<cluster>:<db> or <db>)")
+    diff.add_argument("b", help="second database (<cluster>:<db> or <db>)")
 
     sub.add_parser("init", help="create a starter config file")
 
@@ -486,7 +659,11 @@ def main(argv: list[str] | None = None) -> None:
             _require_tools("mongosh", "mongodump")
         _cmd_snapshot(config, args)
     elif args.command == "restore":
-        if args.database is None and not args.file:
-            sys.exit("bongo: restore needs a database or --file")
         _require_tools("mongosh", "mongorestore")
         _cmd_restore(config, args)
+    elif args.command == "sh":
+        _require_tools("mongosh")
+        _cmd_sh(config, args)
+    elif args.command == "diff":
+        _require_tools("mongosh")
+        _cmd_diff(config, args)
