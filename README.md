@@ -88,6 +88,37 @@ export AZURE_SAS_TOKEN=sv=2021-...&sig=...
 
 Navigation: `j`/`k` to scroll, `/` to search, `←`/`→` for long lines, `Ctrl+C` to pause follow mode, `F` to resume, `q` to quit.
 
+### bongo
+
+Copy, list and drop MongoDB databases across configured clusters — a thin wrapper over `mongodump`/`mongorestore`. Handy for cloning a base database before testing a PR with destructive migrations.
+
+Requires `mongosh` and the MongoDB database tools (`brew install mongosh mongodb-database-tools`).
+
+```bash
+bongo init                            # create a starter config
+bongo cp main pr-539                  # copy within the default cluster
+bongo cp atlas-dev:staging local:main # copy across clusters (streamed, no temp files)
+bongo ls                              # list databases on the default cluster (with sizes)
+bongo ls atlas-dev
+bongo rm pr-539                       # drop a database (asks for confirmation)
+```
+
+Databases are addressed as `<cluster>:<db>`; a bare `<db>` uses the default cluster. Clusters are defined in `~/.config/bongo/config.toml`:
+
+```toml
+default = "local"
+
+[clusters.local]
+uri = "mongodb://localhost:27017"
+protected = ["main"]
+
+[clusters.atlas-dev]
+uri = "mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net"
+protected = []
+```
+
+Databases listed in `protected` cannot be dropped or overwritten without `--force`. Copying onto an existing database prompts before replacing it (`-y` skips the prompt).
+
 ### oneshot
 
 One-shot LLM query from the terminal — get a shell command or a quick explanation without leaving your workflow.

@@ -11,6 +11,7 @@ dependencies = [
 adbshot = "devtools.adbshot:main"
 adbw = "devtools.adbw:main"
 azlogs = "devtools.azlogs:main"
+bongo = "devtools.bongo:main"
 oneshot = "devtools.oneshot:main"
 
 [build-system]
