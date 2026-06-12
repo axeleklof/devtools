@@ -106,8 +106,8 @@ In command mode the command is automatically copied to your clipboard. Useful al
 
 ```bash
 alias osc='oneshot'
-ose() { oneshot -x "$@" | glow -; }   # explain, rendered
-osv() { oneshot -v "$@" | glow -; }   # command + explanation, rendered
+ose() { oneshot -x "$@" | glow -; }     # explain, rendered
+osv() { oneshot -v -m "$@" | glow -; }  # command + explanation, rendered
 ```
 
 #### Configuration

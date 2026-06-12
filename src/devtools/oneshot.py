@@ -352,6 +352,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Use a named profile from ~/.config/oneshot/config.toml",
     )
     parser.add_argument(
+        "-m", "--md",
+        action="store_true",
+        help="Markdown-safe output — hints go to stderr, command wrapped in a code block",
+    )
+    parser.add_argument(
         "--no-clip",
         action="store_true",
         help="Do not copy command to clipboard",
@@ -377,12 +382,19 @@ def main(argv: list[str] | None = None) -> None:
         if command:
             if not args.no_clip:
                 _copy_to_clipboard(command)
+            hint = "(command copied to clipboard)" if args.verbose else "(copied to clipboard)"
             if args.verbose:
                 print(response)
-                print("\n\x1b[2m(command copied to clipboard)\x1b[0m")
+            elif args.md:
+                print(f"```bash\n{command}\n```")
             else:
                 print(command)
-                print("\x1b[2m(copied to clipboard)\x1b[0m", file=sys.stderr)
+            if args.md:
+                print(hint, file=sys.stderr)
+            elif args.verbose:
+                print(f"\n\x1b[2m{hint}\x1b[0m")
+            else:
+                print(f"\x1b[2m{hint}\x1b[0m", file=sys.stderr)
         else:
             print(response)
     else:
