@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 try:
@@ -16,6 +17,9 @@ except ImportError:
     import tomli as tomllib  # type: ignore[no-redef]
 
 _CONFIG_PATH = Path.home() / ".config" / "bongo" / "config.toml"
+_STATE_PATH = Path.home() / ".config" / "bongo" / "state.json"
+_SNAPSHOT_DIR = Path.home() / ".local" / "share" / "bongo" / "snapshots"
+_TIMESTAMP_FMT = "%Y%m%d-%H%M%S"
 
 _DB_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -79,6 +83,42 @@ def _resolve_address(config: dict, address: str) -> tuple[str, str]:
 
 def _is_protected(config: dict, cluster_name: str, db: str) -> bool:
     return db in config["clusters"][cluster_name].get("protected", [])
+
+
+# ---------------------------------------------------------------------------
+# State — manifest of databases bongo has created, used by prune
+# ---------------------------------------------------------------------------
+
+def _load_state() -> dict:
+    if not _STATE_PATH.exists():
+        return {"created": {}}
+    try:
+        with open(_STATE_PATH) as f:
+            state = json.load(f)
+    except Exception:
+        return {"created": {}}
+    state.setdefault("created", {})
+    return state
+
+
+def _save_state(state: dict) -> None:
+    _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _STATE_PATH.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def _record_created(cluster_name: str, db: str, source: str) -> None:
+    state = _load_state()
+    state["created"][f"{cluster_name}:{db}"] = {
+        "source": source,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _save_state(state)
+
+
+def _forget_created(cluster_name: str, db: str) -> None:
+    state = _load_state()
+    if state["created"].pop(f"{cluster_name}:{db}", None) is not None:
+        _save_state(state)
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +224,7 @@ def _cmd_rm(config: dict, args: argparse.Namespace) -> None:
         sys.exit("bongo: aborted")
 
     _drop_database(cluster["uri"], db)
+    _forget_created(cluster_name, db)
     print(f"Dropped '{cluster_name}:{db}'")
 
 
@@ -227,6 +268,126 @@ def _cmd_cp(config: dict, args: argparse.Namespace) -> None:
         sys.exit(f"bongo: mongodump exited with code {dump_rc}")
     if restore_rc != 0:
         sys.exit(f"bongo: mongorestore exited with code {restore_rc}")
+    _record_created(dst_cluster_name, dst_db, f"{src_cluster_name}:{src_db}")
+    print(f"Done — '{dst_cluster_name}:{dst_db}' is ready")
+
+
+def _cmd_prune(config: dict, args: argparse.Namespace) -> None:
+    cluster_name = args.cluster or config.get("default")
+    if not cluster_name:
+        sys.exit("bongo: no cluster given and no default cluster is set in config")
+    cluster = _get_cluster(config, cluster_name)
+
+    state = _load_state()
+    existing = {d["name"] for d in _list_databases(cluster["uri"])}
+
+    candidates: list[tuple[str, dict]] = []
+    for key, meta in list(state["created"].items()):
+        entry_cluster, _, db = key.partition(":")
+        if entry_cluster != cluster_name:
+            continue
+        if db not in existing:
+            del state["created"][key]  # dropped outside bongo — clean up the manifest
+            continue
+        if _is_protected(config, cluster_name, db):
+            continue
+        age_days = (datetime.now() - datetime.fromisoformat(meta["created_at"])).days
+        if args.days is not None and age_days < args.days:
+            continue
+        candidates.append((db, {**meta, "age_days": age_days}))
+    _save_state(state)
+
+    if not candidates:
+        print(f"Nothing to prune on '{cluster_name}'")
+        return
+    for db, meta in sorted(candidates, key=lambda c: c[0]):
+        age = f"{meta['age_days']}d old" if meta["age_days"] else "today"
+        label = f"'{cluster_name}:{db}' (from {meta['source']}, {age})"
+        if args.yes or _confirm(f"Drop {label}?"):
+            _drop_database(cluster["uri"], db)
+            _forget_created(cluster_name, db)
+            print(f"Dropped {label}")
+
+
+def _snapshot_files(cluster_name: str | None = None, db: str | None = None) -> list[Path]:
+    pattern = f"{cluster_name or '*'}__{db or '*'}__*.archive.gz"
+    return sorted(_SNAPSHOT_DIR.glob(pattern))
+
+
+def _cmd_snapshot(config: dict, args: argparse.Namespace) -> None:
+    if args.database is None:
+        snapshots = _snapshot_files()
+        if not snapshots:
+            print(f"No snapshots in {_SNAPSHOT_DIR}")
+            return
+        for path in snapshots:
+            size = _format_size(path.stat().st_size)
+            print(f"  {path.name:<55} {size:>10}")
+        return
+
+    cluster_name, db = _resolve_address(config, args.database)
+    uri = config["clusters"][cluster_name]["uri"]
+    if not _db_exists(uri, db):
+        sys.exit(f"bongo: database '{db}' not found on cluster '{cluster_name}'")
+
+    _SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime(_TIMESTAMP_FMT)
+    path = _SNAPSHOT_DIR / f"{cluster_name}__{db}__{timestamp}.archive.gz"
+
+    print(f"Snapshotting '{cluster_name}:{db}' ...")
+    result = subprocess.run(
+        ["mongodump", f"--uri={uri}", f"--db={db}", "--gzip", f"--archive={path}"],
+    )
+    if result.returncode != 0:
+        path.unlink(missing_ok=True)
+        sys.exit(f"bongo: mongodump exited with code {result.returncode}")
+    print(f"Done — {path} ({_format_size(path.stat().st_size)})")
+
+
+def _parse_snapshot_filename(path: Path) -> tuple[str, str]:
+    parts = path.name.removesuffix(".archive.gz").split("__")
+    if len(parts) != 3:
+        sys.exit(f"bongo: cannot parse snapshot filename '{path.name}' (expected <cluster>__<db>__<timestamp>.archive.gz)")
+    return parts[0], parts[1]
+
+
+def _cmd_restore(config: dict, args: argparse.Namespace) -> None:
+    if args.file:
+        path = Path(args.file).expanduser()
+        if not path.exists():
+            sys.exit(f"bongo: snapshot file not found: {path}")
+        src_cluster_name, src_db = _parse_snapshot_filename(path)
+    else:
+        src_cluster_name, src_db = _resolve_address(config, args.database)
+        snapshots = _snapshot_files(src_cluster_name, src_db)
+        if not snapshots:
+            sys.exit(f"bongo: no snapshots found for '{src_cluster_name}:{src_db}' — create one with 'bongo snapshot'")
+        path = snapshots[-1]  # timestamped filenames sort chronologically
+
+    dst_cluster_name, dst_db = _resolve_address(config, args.target or f"{src_cluster_name}:{src_db}")
+    dst_uri = config["clusters"][dst_cluster_name]["uri"]
+
+    overwrite = _db_exists(dst_uri, dst_db)
+    if overwrite:
+        if _is_protected(config, dst_cluster_name, dst_db) and not args.force:
+            sys.exit(f"bongo: '{dst_cluster_name}:{dst_db}' is protected — use --force to overwrite it")
+        if not args.yes and not _confirm(
+            f"Restore '{path.name}' over existing '{dst_cluster_name}:{dst_db}'?"
+        ):
+            sys.exit("bongo: aborted")
+
+    print(f"Restoring '{path.name}' -> '{dst_cluster_name}:{dst_db}' ...")
+    restore_cmd = [
+        "mongorestore", f"--uri={dst_uri}", "--gzip", f"--archive={path}",
+        f"--nsFrom={src_db}.*", f"--nsTo={dst_db}.*",
+    ]
+    if overwrite:
+        restore_cmd.append("--drop")
+    result = subprocess.run(restore_cmd)
+    if result.returncode != 0:
+        sys.exit(f"bongo: mongorestore exited with code {result.returncode}")
+    if not overwrite:
+        _record_created(dst_cluster_name, dst_db, str(path.name))
     print(f"Done — '{dst_cluster_name}:{dst_db}' is ready")
 
 
@@ -257,6 +418,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  bongo ls                          # databases on the default cluster\n"
             "  bongo ls atlas-dev\n"
             "  bongo rm pr-539\n"
+            "  bongo prune --days 7              # offer to drop bongo-created dbs older than a week\n"
+            "  bongo snapshot main               # archive to ~/.local/share/bongo/snapshots\n"
+            "  bongo snapshot                    # list snapshots\n"
+            "  bongo restore main                # restore latest snapshot of main in place\n"
+            "  bongo restore main main-redo      # ...or into a different db\n"
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -274,6 +440,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     ls = sub.add_parser("ls", help="list databases on a cluster")
     ls.add_argument("cluster", nargs="?", help="cluster name (defaults to the default cluster)")
+
+    prune = sub.add_parser("prune", help="interactively drop databases created by bongo")
+    prune.add_argument("cluster", nargs="?", help="cluster name (defaults to the default cluster)")
+    prune.add_argument("--days", type=int, metavar="N", help="only consider databases older than N days")
+    prune.add_argument("-y", "--yes", action="store_true", help="drop all candidates without prompting")
+
+    snapshot = sub.add_parser("snapshot", help="dump a database to a local archive (no arg: list snapshots)")
+    snapshot.add_argument("database", nargs="?", help="database to snapshot (<cluster>:<db> or <db>)")
+
+    restore = sub.add_parser("restore", help="restore a database from its latest snapshot")
+    restore.add_argument("database", nargs="?", help="database whose snapshot to restore (<cluster>:<db> or <db>)")
+    restore.add_argument("target", nargs="?", help="target database (defaults to restoring in place)")
+    restore.add_argument("--file", metavar="PATH", help="restore a specific snapshot file instead of the latest")
+    restore.add_argument("-y", "--yes", action="store_true", help="skip the overwrite confirmation")
+    restore.add_argument("--force", action="store_true", help="allow overwriting a protected database")
 
     sub.add_parser("init", help="create a starter config file")
 
@@ -297,3 +478,15 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "cp":
         _require_tools("mongosh", "mongodump", "mongorestore")
         _cmd_cp(config, args)
+    elif args.command == "prune":
+        _require_tools("mongosh")
+        _cmd_prune(config, args)
+    elif args.command == "snapshot":
+        if args.database is not None:
+            _require_tools("mongosh", "mongodump")
+        _cmd_snapshot(config, args)
+    elif args.command == "restore":
+        if args.database is None and not args.file:
+            sys.exit("bongo: restore needs a database or --file")
+        _require_tools("mongosh", "mongorestore")
+        _cmd_restore(config, args)

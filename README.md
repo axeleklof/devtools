@@ -101,7 +101,14 @@ bongo cp atlas-dev:staging local:main # copy across clusters (streamed, no temp 
 bongo ls                              # list databases on the default cluster (with sizes)
 bongo ls atlas-dev
 bongo rm pr-539                       # drop a database (asks for confirmation)
+bongo prune --days 7                  # offer to drop bongo-created dbs older than a week
+bongo snapshot main                   # gzipped archive in ~/.local/share/bongo/snapshots
+bongo snapshot                        # list snapshots
+bongo restore main                    # restore latest snapshot of main in place
+bongo restore main main-redo          # ...or into a different db (--file picks a specific snapshot)
 ```
+
+bongo keeps a manifest (`~/.config/bongo/state.json`) of databases it created, so `prune` only ever offers to drop those — never databases it didn't make. Snapshots are handy before running a destructive migration: `bongo snapshot main`, run the script, and `bongo restore main` rolls it back.
 
 Databases are addressed as `<cluster>:<db>`; a bare `<db>` uses the default cluster. Clusters are defined in `~/.config/bongo/config.toml`:
 
