@@ -111,6 +111,8 @@ bongo restore main                    # restore latest snapshot of main in place
 bongo restore main main-redo          # ...or into a different db (--file picks a specific snapshot)
 ```
 
+`cp`, `snapshot` and `restore` render one ✓ line per collection with doc counts (plus a live progress bar for the collection in flight, when the output is a terminal). Pass `-v` for the raw mongodump/mongorestore output. Colors respect `NO_COLOR`.
+
 `bongo rm` and `bongo restore` with no arguments open an interactive picker (fzf when installed, a numbered list otherwise). The `rm` picker hides system and protected databases.
 
 bongo keeps a manifest (`~/.config/bongo/state.json`) of databases it created, so `prune` only ever offers to drop those — never databases it didn't make. Snapshots are handy before running a destructive migration: `bongo snapshot main`, run the script, and `bongo restore main` rolls it back.

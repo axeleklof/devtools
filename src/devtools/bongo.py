@@ -9,6 +9,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -249,6 +251,71 @@ def _uri_with_db(uri: str, db: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Progress rendering — turns raw mongodump/mongorestore stderr into clean lines
+# ---------------------------------------------------------------------------
+
+# `2026-06-12T13:59:59+0200\tfinished restoring db.coll (1234 documents, 0 failures)`
+_TOOL_DONE_RE = re.compile(
+    r"\t(?:done dumping|finished restoring) `?([^\s`]+)`? \((\d+) documents?(?:, (\d+) failures?)?\)"
+)
+# `[#######.........]  db.coll  12000/50000  (24.0%)`
+_TOOL_PROGRESS_RE = re.compile(r"\[[#.]*\]\s+(\S+)\s+\d+/\d+\s+\(([\d.]+)%\)")
+
+
+def _c(code: str, text: str) -> str:
+    if sys.stdout.isatty() and not os.environ.get("NO_COLOR"):
+        return f"\x1b[{code}m{text}\x1b[0m"
+    return text
+
+
+def _collection_of(namespace: str) -> str:
+    return namespace.split(".", 1)[1] if "." in namespace else namespace
+
+
+def _stream_mongo_progress(stream) -> dict:
+    """Consume a mongo tool's stderr, printing one line per finished collection
+    and an in-place progress bar for the collection currently in flight."""
+    stats = {"collections": 0, "docs": 0, "failures": 0, "tail": deque(maxlen=15)}
+    interactive = sys.stdout.isatty()
+    bar_active = False
+
+    def clear_bar() -> None:
+        nonlocal bar_active
+        if bar_active:
+            sys.stdout.write("\r\x1b[2K")
+            bar_active = False
+
+    for line in stream:
+        stats["tail"].append(line)
+        done = _TOOL_DONE_RE.search(line)
+        if done:
+            docs, failures = int(done.group(2)), int(done.group(3) or 0)
+            stats["collections"] += 1
+            stats["docs"] += docs
+            stats["failures"] += failures
+            clear_bar()
+            note = "  " + _c("31", f"{failures:,} failed!") if failures else ""
+            print(f"  {_c('32', '✓')} {_collection_of(done.group(1)):<34} {docs:>12,} docs{note}")
+            continue
+        progress = _TOOL_PROGRESS_RE.search(line)
+        if progress and interactive:
+            pct = float(progress.group(2))
+            filled = int(pct / 100 * 22)
+            bar = "=" * filled + ">" + " " * (22 - filled)
+            sys.stdout.write(
+                f"\r\x1b[2K  {_c('36', '▸')} {_collection_of(progress.group(1)):<34} [{bar}] {pct:5.1f}%"
+            )
+            sys.stdout.flush()
+            bar_active = True
+    clear_bar()
+    return stats
+
+
+def _summary(stats: dict) -> str:
+    return f"{stats['collections']} collections, {stats['docs']:,} docs"
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -317,10 +384,12 @@ def _cmd_cp(config: dict, args: argparse.Namespace) -> None:
         ):
             sys.exit("bongo: aborted")
 
+    quiet = not args.verbose
     print(f"Copying '{src_cluster_name}:{src_db}' -> '{dst_cluster_name}:{dst_db}' ...")
     dump = subprocess.Popen(
         ["mongodump", f"--uri={src_uri}", f"--db={src_db}", "--archive"],
         stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE if quiet else None,
     )
     restore_cmd = [
         "mongorestore", f"--uri={dst_uri}", "--archive",
@@ -328,17 +397,35 @@ def _cmd_cp(config: dict, args: argparse.Namespace) -> None:
     ]
     if overwrite:
         restore_cmd.append("--drop")
-    restore = subprocess.Popen(restore_cmd, stdin=dump.stdout)
+    restore = subprocess.Popen(
+        restore_cmd, stdin=dump.stdout,
+        stderr=subprocess.PIPE if quiet else None, text=quiet or None,
+    )
     dump.stdout.close()  # let mongodump receive SIGPIPE if mongorestore dies
+
+    stats = None
+    dump_tail: deque[bytes] = deque(maxlen=15)
+    if quiet:
+        # dump's stderr must be drained in parallel or its pipe buffer can fill and stall it
+        drainer = threading.Thread(target=lambda: dump_tail.extend(dump.stderr), daemon=True)
+        drainer.start()
+        stats = _stream_mongo_progress(restore.stderr)
 
     restore_rc = restore.wait()
     dump_rc = dump.wait()
     if dump_rc != 0:
+        if dump_tail:
+            sys.stderr.write(b"".join(dump_tail).decode(errors="replace"))
         sys.exit(f"bongo: mongodump exited with code {dump_rc}")
     if restore_rc != 0:
+        if stats:
+            sys.stderr.writelines(stats["tail"])
         sys.exit(f"bongo: mongorestore exited with code {restore_rc}")
     _record_created(dst_cluster_name, dst_db, f"{src_cluster_name}:{src_db}")
-    print(f"Done — '{dst_cluster_name}:{dst_db}' is ready")
+    suffix = f" ({_summary(stats)})" if stats else ""
+    print(f"Done — '{dst_cluster_name}:{dst_db}' is ready{suffix}")
+    if stats and stats["failures"]:
+        sys.exit(f"bongo: warning: {stats['failures']:,} documents failed to restore")
 
 
 def _cmd_prune(config: dict, args: argparse.Namespace) -> None:
@@ -403,14 +490,20 @@ def _cmd_snapshot(config: dict, args: argparse.Namespace) -> None:
     timestamp = datetime.now().strftime(_TIMESTAMP_FMT)
     path = _SNAPSHOT_DIR / f"{cluster_name}__{db}__{timestamp}.archive.gz"
 
+    quiet = not args.verbose
     print(f"Snapshotting '{cluster_name}:{db}' ...")
-    result = subprocess.run(
+    dump = subprocess.Popen(
         ["mongodump", f"--uri={uri}", f"--db={db}", "--gzip", f"--archive={path}"],
+        stderr=subprocess.PIPE if quiet else None, text=quiet or None,
     )
-    if result.returncode != 0:
+    stats = _stream_mongo_progress(dump.stderr) if quiet else None
+    if dump.wait() != 0:
+        if stats:
+            sys.stderr.writelines(stats["tail"])
         path.unlink(missing_ok=True)
-        sys.exit(f"bongo: mongodump exited with code {result.returncode}")
-    print(f"Done — {path} ({_format_size(path.stat().st_size)})")
+        sys.exit(f"bongo: mongodump exited with code {dump.returncode}")
+    suffix = f", {_summary(stats)}" if stats else ""
+    print(f"Done — {path} ({_format_size(path.stat().st_size)}{suffix})")
 
 
 def _parse_snapshot_filename(path: Path) -> tuple[str, str]:
@@ -453,6 +546,7 @@ def _cmd_restore(config: dict, args: argparse.Namespace) -> None:
         ):
             sys.exit("bongo: aborted")
 
+    quiet = not args.verbose
     print(f"Restoring '{path.name}' -> '{dst_cluster_name}:{dst_db}' ...")
     restore_cmd = [
         "mongorestore", f"--uri={dst_uri}", "--gzip", f"--archive={path}",
@@ -460,12 +554,20 @@ def _cmd_restore(config: dict, args: argparse.Namespace) -> None:
     ]
     if overwrite:
         restore_cmd.append("--drop")
-    result = subprocess.run(restore_cmd)
-    if result.returncode != 0:
-        sys.exit(f"bongo: mongorestore exited with code {result.returncode}")
+    restore = subprocess.Popen(
+        restore_cmd, stderr=subprocess.PIPE if quiet else None, text=quiet or None,
+    )
+    stats = _stream_mongo_progress(restore.stderr) if quiet else None
+    if restore.wait() != 0:
+        if stats:
+            sys.stderr.writelines(stats["tail"])
+        sys.exit(f"bongo: mongorestore exited with code {restore.returncode}")
     if not overwrite:
         _record_created(dst_cluster_name, dst_db, str(path.name))
-    print(f"Done — '{dst_cluster_name}:{dst_db}' is ready")
+    suffix = f" ({_summary(stats)})" if stats else ""
+    print(f"Done — '{dst_cluster_name}:{dst_db}' is ready{suffix}")
+    if stats and stats["failures"]:
+        sys.exit(f"bongo: warning: {stats['failures']:,} documents failed to restore")
 
 
 def _cmd_sh(config: dict, args: argparse.Namespace) -> None:
@@ -598,6 +700,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     cp.add_argument("target", help="target database (<cluster>:<db> or <db>)")
     cp.add_argument("-y", "--yes", action="store_true", help="skip the overwrite confirmation")
     cp.add_argument("--force", action="store_true", help="allow overwriting a protected database")
+    cp.add_argument("-v", "--verbose", action="store_true", help="show raw mongodump/mongorestore output")
 
     rm = sub.add_parser("rm", help="drop a database (no arg: pick interactively)")
     rm.add_argument("database", nargs="?", help="database to drop (<cluster>:<db> or <db>)")
@@ -614,6 +717,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     snapshot = sub.add_parser("snapshot", help="dump a database to a local archive (no arg: list snapshots)")
     snapshot.add_argument("database", nargs="?", help="database to snapshot (<cluster>:<db> or <db>)")
+    snapshot.add_argument("-v", "--verbose", action="store_true", help="show raw mongodump output")
 
     restore = sub.add_parser("restore", help="restore a database from its latest snapshot (no arg: pick interactively)")
     restore.add_argument("database", nargs="?", help="database whose snapshot to restore (<cluster>:<db> or <db>)")
@@ -621,6 +725,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     restore.add_argument("--file", metavar="PATH", help="restore a specific snapshot file instead of the latest")
     restore.add_argument("-y", "--yes", action="store_true", help="skip the overwrite confirmation")
     restore.add_argument("--force", action="store_true", help="allow overwriting a protected database")
+    restore.add_argument("-v", "--verbose", action="store_true", help="show raw mongorestore output")
 
     sh = sub.add_parser("sh", help="open a mongosh shell on a configured cluster")
     sh.add_argument("target", nargs="?", help="<cluster>, <cluster>:<db> or <db> (defaults to the default cluster)")
