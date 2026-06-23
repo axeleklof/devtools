@@ -22,9 +22,15 @@ except ImportError:
 _CONFIG_PATH = Path.home() / ".config" / "oneshot" / "config.toml"
 _STDIN_LIMIT = 32 * 1024  # 32 KB
 
+# Drop-in upgrades: when present, prefer these over their POSIX equivalents.
+_PREFERRED_TOOLS = {
+    "rg": "grep",
+    "fd": "find",
+}
+
 # Tools that are useful when available but should not override standard choices.
 _POWER_TOOLS = [
-    "fd", "rg", "fzf", "broot",
+    "fzf", "broot",
     "jq", "yq", "bat", "delta", "xsv",
     "http", "curlie",
     "gh", "lazygit",
@@ -41,6 +47,16 @@ _RUNTIMES = ["python3", "node", "go", "ruby", "bun"]
 def _detect_tools() -> str:
     found = [t for t in _POWER_TOOLS if shutil.which(t)]
     return ", ".join(found) if found else ""
+
+
+def _detect_preferred_tools() -> str:
+    """Drop-in upgrades that should be preferred over their POSIX equivalent."""
+    pairs = [
+        f"{tool} over {legacy}"
+        for tool, legacy in _PREFERRED_TOOLS.items()
+        if shutil.which(tool)
+    ]
+    return ", ".join(pairs) if pairs else ""
 
 
 def _detect_runtimes() -> str:
@@ -95,10 +111,17 @@ def _build_context() -> str:
 
     lines.append(f"System: {os_str}, {shell_str}{git}, cwd: {cwd_name}, date: {today}")
 
+    preferred = _detect_preferred_tools()
+    if preferred:
+        lines.append(
+            f"Prefer these faster drop-in replacements when they fit: {preferred}. "
+            f"They are installed and should be the default over their POSIX equivalent."
+        )
+
     tools = _detect_tools()
     if tools:
         lines.append(
-            f"Prefer standard POSIX tools (find, grep, awk, sed, curl). "
+            f"Default to standard POSIX tools (awk, sed, curl). "
             f"These are also installed if they offer a clear advantage: {tools}"
         )
 
