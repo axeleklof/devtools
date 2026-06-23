@@ -56,13 +56,15 @@ _LESSKEY_SRC = "#command\n[ quit \\062\n] quit \\063\n"
 _LESS_PROMPT = r"lines %lt-%lb/%L (%pB\%)"
 _LESS_BASE = [
     "less",
-    "-RINSs",
+    "-RINs",  # raw / ignore-case search / line numbers / squeeze blanks
     "--incsearch",
     "-j.5",
     "--use-color",
     "--color=PK",
     "-Ps" + _LESS_PROMPT,
 ]
+# Long lines are chopped (scroll horizontally with ←/→) unless --wrap is given.
+_LESS_CHOP = "-S"
 
 _WEEKDAYS = [
     "monday",
@@ -89,6 +91,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  azlogs river 06-20      # most recent June 20\n"
             "  azlogs river 2026-06-18 # an explicit date\n"
             "  azlogs river --days 3   # preload the last 3 days into one buffer\n"
+            "  azlogs river -w         # wrap long lines instead of chopping them\n"
             "  azlogs river -f         # follow today's log, poll every 5s\n"
             "  azlogs river -f 10      # follow today's log, poll every 10s\n"
             "\n"
@@ -98,7 +101,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  G/g                    jump to end/start\n"
             "  /pattern               search forward\n"
             "  n/N                    next/previous match\n"
-            "  ←/→                    scroll horizontally (chopped lines)\n"
+            "  ←/→                    scroll horizontally (chopped lines; see -w)\n"
             "  F                      toggle follow mode (in -f)\n"
             "  q                      quit\n"
             "\n"
@@ -129,6 +132,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1,
         metavar="N",
         help="preload the N most recent days up to WHEN into one buffer (default: 1)",
+    )
+    parser.add_argument(
+        "-w",
+        "--wrap",
+        action="store_true",
+        help="wrap long lines instead of chopping them (default: chop, scroll with ←/→)",
     )
     parser.add_argument(
         "--mouse",
@@ -411,6 +420,7 @@ def _browse(
     anchor: date,
     days: int,
     mouse: bool = False,
+    wrap: bool = False,
 ) -> None:
     """View logs with inline [ / ] navigation between adjacent days.
 
@@ -452,6 +462,8 @@ def _browse(
 
             # -K makes less quit on Ctrl-C (like q), exiting the loop below.
             less_cmd = [*_LESS_BASE, "-K", f"--lesskey-src={keyfile}", firstcmd, str(tmp)]
+            if not wrap:
+                less_cmd.append(_LESS_CHOP)
             if mouse:
                 less_cmd.append("--mouse")
             # Swallow our own copy of SIGINT with a no-op handler (no traceback). A
@@ -487,7 +499,14 @@ def _browse(
         tmp.unlink(missing_ok=True)
 
 
-def _follow_log(url: str, customer: str, date_str: str, interval: float, mouse: bool = False) -> None:
+def _follow_log(
+    url: str,
+    customer: str,
+    date_str: str,
+    interval: float,
+    mouse: bool = False,
+    wrap: bool = False,
+) -> None:
     tmp = Path(tempfile.mktemp(prefix="azlogs_", suffix=".log"))
     stop = threading.Event()
 
@@ -506,6 +525,8 @@ def _follow_log(url: str, customer: str, date_str: str, interval: float, mouse: 
         thread.start()
 
         less_cmd = [*_LESS_BASE, "+GF", str(tmp)]
+        if not wrap:
+            less_cmd.append(_LESS_CHOP)
         if mouse:
             less_cmd.append("--mouse")
         # Ignore SIGINT in Python so Ctrl+C only reaches less (exits follow mode)
@@ -589,7 +610,12 @@ def main(argv: list[str] | None = None) -> None:
     if args.follow is not None:
         url = _blob_url(base_url, container, date_to_blob[anchor], sas_token)
         _follow_log(
-            url, customer_display, anchor.isoformat(), interval=args.follow, mouse=args.mouse
+            url,
+            customer_display,
+            anchor.isoformat(),
+            interval=args.follow,
+            mouse=args.mouse,
+            wrap=args.wrap,
         )
     else:
         _browse(
@@ -602,4 +628,5 @@ def main(argv: list[str] | None = None) -> None:
             anchor,
             days=max(1, args.days),
             mouse=args.mouse,
+            wrap=args.wrap,
         )

@@ -83,6 +83,7 @@ azlogs river mon              # most recent Monday (weekday names: mon, tue, ...
 azlogs river 06-20            # most recent June 20 (MM-DD)
 azlogs river 2026-06-18       # an explicit date (YYYY-MM-DD)
 azlogs river --days 3         # preload the last 3 days into one scrollable buffer
+azlogs river -w               # wrap long lines instead of chopping them
 azlogs river -f               # follow mode: poll for new lines every 5s
 azlogs river -f 10            # follow mode with 10s poll interval
 ```
@@ -98,7 +99,7 @@ export AZURE_SAS_TOKEN=sv=2021-...&sig=...
 
 Only blobs from the last 14 days are listed, which is also how far the inline `[` navigation can reach back.
 
-Navigation: `j`/`k` to scroll, `[`/`]` to load the previous/next day's log inline (merged seamlessly into the same scroll buffer), `/` to search, `←`/`→` for long lines, `q` or `Ctrl+C` to quit.
+Navigation: `j`/`k` to scroll, `[`/`]` to load the previous/next day's log inline (merged seamlessly into the same scroll buffer), `/` to search, `←`/`→` for long lines (or run with `-w` to wrap instead), `q` or `Ctrl+C` to quit.
 
 In follow mode (`-f`), `Ctrl+C` pauses following so you can scroll back, `F` resumes, and `q` quits.
 
