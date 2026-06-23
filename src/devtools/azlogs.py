@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import re
 import shutil
@@ -43,6 +44,36 @@ _DEFAULT_LEVEL_COLOR = b"\033[36m"  # cyan for unrecognized levels
 _DEFAULT_KEY_COLOR = b"\033[33m"  # yellow for unrecognized keys
 _POLL_INTERVAL = 5.0
 
+# less quits with these exit codes when [ / ] are pressed (see _LESSKEY_SRC).
+# 50 = octal 062, 51 = octal 063; less uses the ASCII value of the quit action's
+# extra string as its exit status.
+_EXIT_PREV = 50
+_EXIT_NEXT = 51
+_LESSKEY_SRC = "#command\n[ quit \\062\n] quit \\063\n"
+
+# Quiet, low-contrast status line: position only (no temp-file path), rendered
+# in dim gray (--color=PK) instead of less's default white standout bar.
+_LESS_PROMPT = r"lines %lt-%lb/%L (%pB\%)"
+_LESS_BASE = [
+    "less",
+    "-RINSs",
+    "--incsearch",
+    "-j.5",
+    "--use-color",
+    "--color=PK",
+    "-Ps" + _LESS_PROMPT,
+]
+
+_WEEKDAYS = [
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+]
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -53,11 +84,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Examples:\n"
             "  azlogs                  # pick customer and date interactively\n"
             "  azlogs river            # open today's log for 'riverview'\n"
+            "  azlogs river 1          # yesterday's log (N days ago)\n"
+            "  azlogs river mon        # most recent Monday\n"
+            "  azlogs river 06-20      # most recent June 20\n"
+            "  azlogs river 2026-06-18 # an explicit date\n"
+            "  azlogs river --days 3   # preload the last 3 days into one buffer\n"
             "  azlogs river -f         # follow today's log, poll every 5s\n"
             "  azlogs river -f 10      # follow today's log, poll every 10s\n"
             "\n"
             "Navigation (less):\n"
             "  j/k or ↑/↓             scroll up/down\n"
+            "  [ / ]                  load the previous / next day's log inline\n"
             "  G/g                    jump to end/start\n"
             "  /pattern               search forward\n"
             "  n/N                    next/previous match\n"
@@ -75,6 +112,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="?",
         metavar="CUSTOMER",
         help="fuzzy customer name — skips both pickers and opens today's log",
+    )
+    parser.add_argument(
+        "when",
+        nargs="?",
+        metavar="WHEN",
+        help=(
+            "which day to open: N days ago (1=yesterday), YYYY-MM-DD, MM-DD, or a "
+            "weekday name (mon, tue, ...). Defaults to today."
+        ),
+    )
+    parser.add_argument(
+        "-d",
+        "--days",
+        type=int,
+        default=1,
+        metavar="N",
+        help="preload the N most recent days up to WHEN into one buffer (default: 1)",
     )
     parser.add_argument(
         "--mouse",
@@ -271,24 +325,166 @@ def _poll_log(
             pass  # never crash the background thread
 
 
-def _open_log(url: str, customer: str, date_str: str, mouse: bool = False) -> None:
-    fetched = datetime.now().strftime("%H:%M:%S")
-    banner = _banner_line(customer, date_str, f"fetched {fetched}")
-    less_cmd = ["less", "-RINSs", "--incsearch", "-M", "-j.5", "+G"]
-    if mouse:
-        less_cmd.append("--mouse")
-    less_proc = subprocess.Popen(less_cmd, stdin=subprocess.PIPE)
+def _parse_when(token: str, today: date) -> date | None:
+    """Resolve a WHEN token to a date, or None if it can't be parsed."""
+    t = token.strip().lower()
+    if not t:
+        return None
+    if t.isdigit():
+        return today - timedelta(days=int(t))
     try:
-        less_proc.stdin.write(banner)  # type: ignore[union-attr]
-        _stream_to_dest(url, less_proc.stdin)
-        less_proc.stdin.write(b"\n" + banner)  # type: ignore[union-attr]
+        return date.fromisoformat(t)
+    except ValueError:
+        pass
+    m = re.fullmatch(r"(\d{1,2})-(\d{1,2})", t)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        for year in (today.year, today.year - 1):
+            try:
+                cand = date(year, month, day)
+            except ValueError:
+                return None
+            if cand <= today:
+                return cand
+        return None
+    if len(t) >= 2:
+        for idx, name in enumerate(_WEEKDAYS):
+            if name.startswith(t):
+                delta = (today.weekday() - idx) % 7
+                return today - timedelta(days=delta)
+    return None
+
+
+def _blob_url(base_url: str, container: str, blob_name: str, sas_token: str) -> str:
+    return f"{base_url}/{container}/{blob_name}?{sas_token}"
+
+
+def _first_older(dates: list[date], d: date) -> date | None:
+    cands = [x for x in dates if x < d]
+    return max(cands) if cands else None
+
+
+def _first_newer(dates: list[date], d: date) -> date | None:
+    cands = [x for x in dates if x > d]
+    return min(cands) if cands else None
+
+
+def _fetch_day(url: str) -> bytes:
+    """Fetch and colorize one day's log into memory, newline-terminated."""
+    buf = io.BytesIO()
+    _stream_to_dest(url, buf)
+    data = buf.getvalue()
+    if data and not data.endswith(b"\n"):
+        data += b"\n"
+    return data
+
+
+def _build_combined(
+    loaded: list[date],
+    content: dict[date, bytes],
+    banner: dict[date, bytes],
+    tmp: Path,
+) -> list[int]:
+    """Write banner+content for each loaded day into tmp (oldest→newest).
+
+    Returns the 1-based line number at which each day's banner begins, so the
+    caller can anchor less at a day boundary after extending the buffer.
+    """
+    banner_lines: list[int] = []
+    line = 1
+    with tmp.open("wb") as f:
+        for d in loaded:
+            banner_lines.append(line)
+            f.write(banner[d])  # banner is exactly one line
+            f.write(content[d])
+            line += 1 + content[d].count(b"\n")
+    return banner_lines
+
+
+def _browse(
+    base_url: str,
+    sas_token: str,
+    container: str,
+    customer: str,
+    date_to_blob: dict[date, str],
+    dates: list[date],
+    anchor: date,
+    days: int,
+    mouse: bool = False,
+) -> None:
+    """View logs with inline [ / ] navigation between adjacent days.
+
+    less is relaunched on a rebuilt multi-day buffer each time the user presses
+    [ or ] (which quit less with a distinct exit code). Because extending always
+    happens at the top or bottom edge, re-anchoring on the day boundary keeps the
+    transition seamless.
+    """
+    keyfile = Path(tempfile.mktemp(prefix="azlogs_keys_", suffix=".lesskey"))
+    keyfile.write_text(_LESSKEY_SRC)
+    tmp = Path(tempfile.mktemp(prefix="azlogs_", suffix=".log"))
+
+    content: dict[date, bytes] = {}
+    banner: dict[date, bytes] = {}
+
+    available = [d for d in dates if d <= anchor]
+    loaded = sorted(available[:days]) if available else [anchor]
+    # pending drives the start position on the next launch:
+    #   None -> bottom; ("top"/"bottom") -> edge; ("anchor", date) -> that day's banner
+    pending: tuple[str, date | None] | None = None
+
+    try:
+        while True:
+            for d in loaded:
+                if d not in content:
+                    fetched = datetime.now().strftime("%H:%M:%S")
+                    url = _blob_url(base_url, container, date_to_blob[d], sas_token)
+                    content[d] = _fetch_day(url)
+                    banner[d] = _banner_line(customer, d.isoformat(), f"fetched {fetched}")
+
+            banner_lines = _build_combined(loaded, content, banner, tmp)
+
+            if pending is None or pending[0] == "bottom":
+                firstcmd = "+G"
+            elif pending[0] == "top":
+                firstcmd = "+g"
+            else:  # ("anchor", date)
+                firstcmd = f"+{banner_lines[loaded.index(pending[1])]}g"
+
+            # -K makes less quit on Ctrl-C (like q), exiting the loop below.
+            less_cmd = [*_LESS_BASE, "-K", f"--lesskey-src={keyfile}", firstcmd, str(tmp)]
+            if mouse:
+                less_cmd.append("--mouse")
+            # Swallow our own copy of SIGINT with a no-op handler (no traceback). A
+            # no-op handler — unlike SIG_IGN — is reset to SIG_DFL across exec, so
+            # less installs its own handler and -K takes effect.
+            old_sigint = signal.signal(signal.SIGINT, lambda *_: None)
+            try:
+                rc = subprocess.run(less_cmd).returncode
+            finally:
+                signal.signal(signal.SIGINT, old_sigint)
+
+            if rc == _EXIT_PREV:
+                older = _first_older(dates, loaded[0])
+                if older is None:
+                    pending = ("top", None)
+                    continue
+                prev_top = loaded[0]
+                loaded.insert(0, older)
+                pending = ("anchor", prev_top)
+            elif rc == _EXIT_NEXT:
+                newer = _first_newer(dates, loaded[-1])
+                if newer is None:
+                    pending = ("bottom", None)
+                    continue
+                loaded.append(newer)
+                pending = ("anchor", newer)
+            else:
+                break
+    except KeyboardInterrupt:
+        pass  # Ctrl-C during a fetch: exit cleanly without a traceback
     finally:
-        try:
-            if less_proc.stdin:
-                less_proc.stdin.close()
-        except BrokenPipeError:
-            pass
-    less_proc.wait()
+        keyfile.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
 
 
 def _follow_log(url: str, customer: str, date_str: str, interval: float, mouse: bool = False) -> None:
@@ -309,9 +505,9 @@ def _follow_log(url: str, customer: str, date_str: str, interval: float, mouse: 
         )
         thread.start()
 
-        less_cmd = ["less", "-RINSs", "--incsearch", "-M", "-j.5", "+GF", str(tmp)]
+        less_cmd = [*_LESS_BASE, "+GF", str(tmp)]
         if mouse:
-            less_cmd.insert(1, "--mouse")
+            less_cmd.append("--mouse")
         # Ignore SIGINT in Python so Ctrl+C only reaches less (exits follow mode)
         # rather than killing this process. User can then scroll freely and press
         # F to resume follow mode, or q to quit.
@@ -353,37 +549,57 @@ def main(argv: list[str] | None = None) -> None:
             print(f"Error: No container matching '{args.customer}'.", file=sys.stderr)
             sys.exit(1)
         container = match + "logs"
-        blobs = _list_blobs(base_url, sas_token, container)
-        today = date.today().isoformat()
-        today_blobs = [b for b in blobs if today in b]
-        if not today_blobs:
-            print(
-                f"Error: No log for today ({today}) found in '{container}'.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        blob_name = today_blobs[0]
-        m = _BLOB_PATTERN.match(blob_name)
-        date_str = m.group(1) if m else today
     else:
-        customer = _fzf_select(customer_names, "customer> ")
-        container = customer + "logs"
-        blobs = _list_blobs(base_url, sas_token, container)
-        if not blobs:
-            print(
-                f"Error: No log files found in '{container}' for the past 14 days.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        today = date.today().isoformat()
-        blob_name = _fzf_select(blobs, "log> ", query=today)
-        m = _BLOB_PATTERN.match(blob_name)
-        date_str = m.group(1) if m else blob_name
+        container = _fzf_select(customer_names, "customer> ") + "logs"
 
-    url = f"{base_url}/{container}/{blob_name}?{sas_token}"
+    blobs = _list_blobs(base_url, sas_token, container)
+    if not blobs:
+        print(
+            f"Error: No log files found in '{container}' for the past 14 days.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    date_to_blob: dict[date, str] = {}
+    for name in blobs:
+        m = _BLOB_PATTERN.match(name)
+        if m:
+            date_to_blob[date.fromisoformat(m.group(1))] = name
+    dates = sorted(date_to_blob, reverse=True)
+    today = date.today()
+
+    target = today
+    if args.when:
+        target = _parse_when(args.when, today)
+        if target is None:
+            print(f"Error: Could not understand date '{args.when}'.", file=sys.stderr)
+            sys.exit(1)
+
+    if args.customer and target in date_to_blob:
+        # Fast path: jump straight to the requested day.
+        anchor = target
+    else:
+        # No customer (interactive), or the requested date has no blob: show the
+        # date picker, pre-seeding the search with the target date.
+        blob_name = _fzf_select(blobs, "log> ", query=target.isoformat())
+        anchor = date.fromisoformat(_BLOB_PATTERN.match(blob_name).group(1))
+
     customer_display = _strip_logs(container)
 
     if args.follow is not None:
-        _follow_log(url, customer_display, date_str, interval=args.follow, mouse=args.mouse)
+        url = _blob_url(base_url, container, date_to_blob[anchor], sas_token)
+        _follow_log(
+            url, customer_display, anchor.isoformat(), interval=args.follow, mouse=args.mouse
+        )
     else:
-        _open_log(url, customer_display, date_str, mouse=args.mouse)
+        _browse(
+            base_url,
+            sas_token,
+            container,
+            customer_display,
+            date_to_blob,
+            dates,
+            anchor,
+            days=max(1, args.days),
+            mouse=args.mouse,
+        )
