@@ -47,6 +47,55 @@ protected = ["main"]
 # Config
 # ---------------------------------------------------------------------------
 
+_KNOWN_TOP_LEVEL = {"default", "clusters"}
+_KNOWN_CLUSTER_KEYS = {"uri", "protected"}
+
+
+def _validate_config(config: dict) -> list[str]:
+    """Return a list of human-readable problems with the parsed config (empty = valid)."""
+    errors: list[str] = []
+
+    for key in config:
+        if key in _KNOWN_TOP_LEVEL:
+            continue
+        if key == "cluster":
+            errors.append(
+                "found a [cluster.*] table (singular) — clusters live under "
+                "[clusters.<name>] (plural); rename your [cluster.x] headers to [clusters.x]"
+            )
+        else:
+            errors.append(f"unknown top-level key '{key}' (expected: default, clusters)")
+
+    clusters = config.get("clusters")
+    if not isinstance(clusters, dict) or not clusters:
+        errors.append("no clusters defined — add at least one [clusters.<name>] with a uri")
+        clusters = {}
+
+    for name, cluster in clusters.items():
+        if not isinstance(cluster, dict):
+            errors.append(f"cluster '{name}' must be a table ([clusters.{name}])")
+            continue
+        uri = cluster.get("uri")
+        if not isinstance(uri, str) or not uri:
+            errors.append(f"cluster '{name}' is missing a non-empty 'uri'")
+        protected = cluster.get("protected", [])
+        if not isinstance(protected, list) or not all(isinstance(p, str) for p in protected):
+            errors.append(f"cluster '{name}': 'protected' must be a list of database names")
+        unknown = set(cluster) - _KNOWN_CLUSTER_KEYS
+        if unknown:
+            keys = ", ".join(sorted(unknown))
+            errors.append(f"cluster '{name}': unknown key(s) {keys} (expected: uri, protected)")
+
+    default = config.get("default")
+    if default is not None:
+        if not isinstance(default, str):
+            errors.append("'default' must be a cluster name (string)")
+        elif default not in clusters:
+            errors.append(f"default cluster '{default}' is not defined under [clusters.{default}]")
+
+    return errors
+
+
 def _load_config() -> dict:
     if not _CONFIG_PATH.exists():
         sys.exit(f"bongo: no config found — run 'bongo init' to create {_CONFIG_PATH}")
@@ -55,8 +104,10 @@ def _load_config() -> dict:
             config = tomllib.load(f)
     except Exception as e:
         sys.exit(f"bongo: could not read config: {e}")
-    if not config.get("clusters"):
-        sys.exit(f"bongo: no clusters defined in {_CONFIG_PATH}")
+    errors = _validate_config(config)
+    if errors:
+        detail = "\n".join(f"  - {e}" for e in errors)
+        sys.exit(f"bongo: invalid config at {_CONFIG_PATH}:\n{detail}\n(run 'bongo check' to re-validate)")
     return config
 
 
@@ -662,6 +713,34 @@ def _cmd_diff(config: dict, args: argparse.Namespace) -> None:
         print(f"{identical} collections identical")
 
 
+def _cmd_check(args: argparse.Namespace) -> None:
+    if not _CONFIG_PATH.exists():
+        sys.exit(f"bongo: no config found — run 'bongo init' to create {_CONFIG_PATH}")
+    try:
+        with open(_CONFIG_PATH, "rb") as f:
+            config = tomllib.load(f)
+    except Exception as e:
+        sys.exit(f"bongo: could not parse {_CONFIG_PATH}: {e}")
+
+    errors = _validate_config(config)
+    if errors:
+        print(f"{_CONFIG_PATH}: invalid", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        sys.exit(1)
+
+    clusters = config["clusters"]
+    default = config.get("default")
+    print(f"{_CONFIG_PATH}: OK — {len(clusters)} cluster(s)")
+    for name in sorted(clusters):
+        tags = ["default"] if name == default else []
+        protected = clusters[name].get("protected", [])
+        if protected:
+            tags.append(f"protected: {', '.join(protected)}")
+        suffix = f"  [{'; '.join(tags)}]" if tags else ""
+        print(f"  {name}  {_redact_uri(clusters[name]['uri'])}{suffix}")
+
+
 def _cmd_init(args: argparse.Namespace) -> None:
     if _CONFIG_PATH.exists():
         sys.exit(f"bongo: config already exists at {_CONFIG_PATH}")
@@ -742,6 +821,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     diff.add_argument("b", help="second database (<cluster>:<db> or <db>)")
 
     sub.add_parser("init", help="create a starter config file")
+    sub.add_parser("check", help="validate the config file and list configured clusters")
 
     return parser.parse_args(argv)
 
@@ -751,6 +831,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "init":
         _cmd_init(args)
+        return
+
+    if args.command == "check":
+        _cmd_check(args)
         return
 
     config = _load_config()
