@@ -115,6 +115,8 @@ bongo cp main pr-539                  # copy within the default cluster
 bongo cp main .                       # '.' = current git branch name, sanitized (user/axel/fix-1 -> user-axel-fix-1)
 bongo cp atlas-dev:staging local:main # copy across clusters (streamed, no temp files)
 bongo sh                              # mongosh shell on the default cluster (or: bongo sh atlas-dev:somedb)
+bongo run adduser pr-539              # run a configured JavaScript script on a database
+bongo run ./fix.js atlas-dev:staging  # run a one-off script file
 bongo diff main pr-539                # compare collections, doc counts and indexes
 bongo ls                              # list databases on the default cluster (with sizes)
 bongo ls atlas-dev
@@ -132,6 +134,28 @@ bongo restore main main-redo          # ...or into a different db (--file picks 
 
 bongo keeps a manifest (`~/.config/bongo/state.json`) of databases it created, so `prune` only ever offers to drop those — never databases it didn't make. Snapshots are handy before running a destructive migration: `bongo snapshot main`, run the script, and `bongo restore main` rolls it back.
 
+`bongo run SCRIPT TARGET` runs a mongosh JavaScript file against `TARGET`. `SCRIPT` is first resolved as a label from `[scripts]`, then as a direct file path. Scripts get the normal mongosh `db` global plus bongo context:
+
+```js
+globalThis.bongo = {
+  cluster: "local",
+  database: "main",
+  target: "local:main",
+  dryRun: false,
+  args: [],
+};
+globalThis.dryRun = globalThis.bongo.dryRun;
+```
+
+`--dry-run` only sets those flags; scripts must opt in to avoid writes.
+
+For local helper scripts, put files under `~/.config/bongo/scripts` and add labels in `[scripts]`:
+
+```bash
+bongo run adduser main
+bongo run adduser main -- --script-specific-option value
+```
+
 Databases are addressed as `<cluster>:<db>`; a bare `<db>` uses the default cluster. Clusters are defined in `~/.config/bongo/config.toml`:
 
 ```toml
@@ -144,6 +168,9 @@ protected = ["main"]
 [clusters.atlas-dev]
 uri = "mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net"
 protected = []
+
+[scripts]
+adduser = "scripts/adduser.js" # relative to ~/.config/bongo
 ```
 
 Databases listed in `protected` cannot be dropped or overwritten without `--force`. Copying onto an existing database prompts before replacing it (`-y` skips the prompt).

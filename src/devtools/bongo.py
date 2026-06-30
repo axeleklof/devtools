@@ -20,6 +20,7 @@ except ImportError:
     import tomli as tomllib  # type: ignore[no-redef]
 
 _CONFIG_PATH = Path.home() / ".config" / "bongo" / "config.toml"
+_CONFIG_DIR = _CONFIG_PATH.parent
 _STATE_PATH = Path.home() / ".config" / "bongo" / "state.json"
 _SNAPSHOT_DIR = Path.home() / ".local" / "share" / "bongo" / "snapshots"
 _TIMESTAMP_FMT = "%Y%m%d-%H%M%S"
@@ -40,6 +41,11 @@ protected = ["main"]
 # [clusters.atlas-dev]
 # uri = "mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net"
 # protected = []
+
+# Optional script labels for `bongo run <label> <cluster>:<db>`.
+# Relative paths resolve from this config directory.
+# [scripts]
+# adduser = "scripts/adduser.js"
 """
 
 
@@ -47,7 +53,7 @@ protected = ["main"]
 # Config
 # ---------------------------------------------------------------------------
 
-_KNOWN_TOP_LEVEL = {"default", "clusters"}
+_KNOWN_TOP_LEVEL = {"default", "clusters", "scripts"}
 _KNOWN_CLUSTER_KEYS = {"uri", "protected"}
 
 
@@ -64,7 +70,7 @@ def _validate_config(config: dict) -> list[str]:
                 "[clusters.<name>] (plural); rename your [cluster.x] headers to [clusters.x]"
             )
         else:
-            errors.append(f"unknown top-level key '{key}' (expected: default, clusters)")
+            errors.append(f"unknown top-level key '{key}' (expected: default, clusters, scripts)")
 
     clusters = config.get("clusters")
     if not isinstance(clusters, dict) or not clusters:
@@ -92,6 +98,16 @@ def _validate_config(config: dict) -> list[str]:
             errors.append("'default' must be a cluster name (string)")
         elif default not in clusters:
             errors.append(f"default cluster '{default}' is not defined under [clusters.{default}]")
+
+    scripts = config.get("scripts", {})
+    if not isinstance(scripts, dict):
+        errors.append("'scripts' must be a table ([scripts])")
+    else:
+        for label, script_path in scripts.items():
+            if not label.strip():
+                errors.append("script labels must be non-empty")
+            if not isinstance(script_path, str) or not script_path.strip():
+                errors.append(f"script '{label}' must point to a non-empty file path")
 
     return errors
 
@@ -158,6 +174,33 @@ def _resolve_address(config: dict, address: str) -> tuple[str, str]:
 
 def _is_protected(config: dict, cluster_name: str, db: str) -> bool:
     return db in config["clusters"][cluster_name].get("protected", [])
+
+
+def _path_from(value: str, base: Path) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return base / path
+
+
+def _resolve_script(config: dict, script: str) -> tuple[str | None, Path]:
+    scripts = config.get("scripts", {})
+    if script in scripts:
+        path = _path_from(scripts[script], _CONFIG_DIR)
+        label: str | None = script
+    else:
+        path = _path_from(script, Path.cwd())
+        label = None
+
+    if not path.exists():
+        if label:
+            sys.exit(f"bongo: script '{label}' points to missing file: {path}")
+        sys.exit(f"bongo: script '{script}' is not configured and no file exists at {path}")
+    if not path.is_file():
+        sys.exit(f"bongo: script path is not a file: {path}")
+    if not os.access(path, os.R_OK):
+        sys.exit(f"bongo: script path is not readable: {path}")
+    return label, path
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +691,33 @@ def _cmd_sh(config: dict, args: argparse.Namespace) -> None:
     os.execvp("mongosh", ["mongosh", uri])
 
 
+def _cmd_run(config: dict, args: argparse.Namespace) -> None:
+    label, path = _resolve_script(config, args.script)
+    cluster_name, db = _resolve_address(config, args.target)
+    uri = _uri_with_db(config["clusters"][cluster_name]["uri"], db)
+    name = label or str(path)
+    context = {
+        "cluster": cluster_name,
+        "database": db,
+        "target": f"{cluster_name}:{db}",
+        "dryRun": args.dry_run,
+        "args": args.script_args,
+    }
+    prelude = (
+        f"globalThis.bongo = {json.dumps(context)};\n"
+        "globalThis.dryRun = globalThis.bongo.dryRun;\n"
+        f"load({json.dumps(str(path))});\n"
+        "undefined;"
+    )
+
+    dry = " (dryRun=true)" if args.dry_run else ""
+    print(f"Running '{name}' on '{cluster_name}:{db}'{dry} ...")
+    result = subprocess.run(["mongosh", uri, "--quiet", "--eval", prelude])
+    if result.returncode != 0:
+        sys.exit(f"bongo: script exited with code {result.returncode}")
+    print("Done")
+
+
 def _collection_stats(uri: str, db: str) -> dict[str, dict]:
     """Return {collection: {count, indexes}} for a database."""
     collections = _mongosh_json(
@@ -739,6 +809,13 @@ def _cmd_check(args: argparse.Namespace) -> None:
             tags.append(f"protected: {', '.join(protected)}")
         suffix = f"  [{'; '.join(tags)}]" if tags else ""
         print(f"  {name}  {_redact_uri(clusters[name]['uri'])}{suffix}")
+    scripts = config.get("scripts", {})
+    if scripts:
+        print("scripts")
+        for label in sorted(scripts):
+            path = _path_from(scripts[label], _CONFIG_DIR)
+            suffix = "" if path.is_file() else "  [missing]"
+            print(f"  {label}  {path}{suffix}")
 
 
 def _cmd_init(args: argparse.Namespace) -> None:
@@ -754,7 +831,33 @@ def _cmd_init(args: argparse.Namespace) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+def _parse_run_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="bongo run", description="Run a mongosh JavaScript file on a database.")
+    parser.add_argument("script", help="script label from [scripts] or a .js file path")
+    parser.add_argument("target", help="target database (<cluster>:<db> or <db>)")
+    parser.add_argument("--dry-run", action="store_true", help="set globalThis.bongo.dryRun and globalThis.dryRun")
+    parser.add_argument("script_args", nargs="*", metavar="ARG", help="arguments exposed as globalThis.bongo.args")
+
+    args_argv = list(argv)
+    script_args: list[str] = []
+    if "--" in args_argv:
+        sep = args_argv.index("--")
+        script_args = args_argv[sep + 1:]
+        args_argv = args_argv[:sep]
+
+    args, unknown = parser.parse_known_args(args_argv)
+    if unknown:
+        parser.error(f"unrecognized arguments: {' '.join(unknown)} (put script arguments after --)")
+    args.command = "run"
+    args.script_args += script_args
+    return args
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    raw_argv = sys.argv[1:] if argv is None else argv
+    if raw_argv[:1] == ["run"]:
+        return _parse_run_args(raw_argv[1:])
+
     parser = argparse.ArgumentParser(
         prog="bongo",
         description="Copy, list and drop MongoDB databases across configured clusters.",
@@ -767,6 +870,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  bongo cp main .                   # '.' = current git branch name, sanitized\n"
             "  bongo cp atlas-dev:staging local:main\n"
             "  bongo sh                          # mongosh shell on the default cluster\n"
+            "  bongo run adduser pr-539          # run a configured script label on a database\n"
+            "  bongo run ./fix.js atlas-dev:main # run a one-off script file\n"
             "  bongo diff main pr-539            # collection/count/index differences\n"
             "  bongo ls                          # databases on the default cluster\n"
             "  bongo ls atlas-dev\n"
@@ -816,6 +921,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     sh = sub.add_parser("sh", help="open a mongosh shell on a configured cluster")
     sh.add_argument("target", nargs="?", help="<cluster>, <cluster>:<db> or <db> (defaults to the default cluster)")
 
+    run = sub.add_parser("run", help="run a mongosh JavaScript file on a database")
+    run.add_argument("script", help="script label from [scripts] or a .js file path")
+    run.add_argument("target", help="target database (<cluster>:<db> or <db>)")
+    run.add_argument("--dry-run", action="store_true", help="set globalThis.bongo.dryRun and globalThis.dryRun")
+    run.add_argument("script_args", nargs="*", metavar="ARG", help="arguments exposed as globalThis.bongo.args")
+
     diff = sub.add_parser("diff", help="compare two databases (collections, doc counts, indexes)")
     diff.add_argument("a", help="first database (<cluster>:<db> or <db>)")
     diff.add_argument("b", help="second database (<cluster>:<db> or <db>)")
@@ -823,7 +934,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     sub.add_parser("init", help="create a starter config file")
     sub.add_parser("check", help="validate the config file and list configured clusters")
 
-    return parser.parse_args(argv)
+    return parser.parse_args(raw_argv)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -860,6 +971,9 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "sh":
         _require_tools("mongosh")
         _cmd_sh(config, args)
+    elif args.command == "run":
+        _require_tools("mongosh")
+        _cmd_run(config, args)
     elif args.command == "diff":
         _require_tools("mongosh")
         _cmd_diff(config, args)
