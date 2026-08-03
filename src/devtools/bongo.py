@@ -13,6 +13,7 @@ import threading
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 try:
     import tomllib
@@ -24,6 +25,8 @@ _CONFIG_DIR = _CONFIG_PATH.parent
 _STATE_PATH = Path.home() / ".config" / "bongo" / "state.json"
 _SNAPSHOT_DIR = Path.home() / ".local" / "share" / "bongo" / "snapshots"
 _TIMESTAMP_FMT = "%Y%m%d-%H%M%S"
+_CHECK_SERVER_SELECTION_TIMEOUT_MS = 5_000
+_CHECK_PROCESS_TIMEOUT_SECONDS = 10
 
 _DB_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -295,6 +298,71 @@ def _drop_database(uri: str, db: str) -> None:
 
 def _redact_uri(uri: str) -> str:
     return re.sub(r"://([^:/@]+):[^@]+@", r"://\1:***@", uri)
+
+
+def _check_uri(uri: str) -> str:
+    if re.search(r"[?&]serverSelectionTimeoutMS=", uri, re.IGNORECASE):
+        return uri
+    separator = "&" if "?" in uri else "?"
+    return f"{uri}{separator}serverSelectionTimeoutMS={_CHECK_SERVER_SELECTION_TIMEOUT_MS}"
+
+
+def _is_atlas_uri(uri: str) -> bool:
+    hostname = urlsplit(uri).hostname
+    return hostname is not None and hostname.lower().endswith(".mongodb.net")
+
+
+def _connection_error(uri: str, detail: str) -> str:
+    detail = _redact_uri(detail.replace(uri, _redact_uri(uri)))
+    timeout_markers = (
+        "timed out",
+        "timeout",
+        "etimedout",
+        "replicasetnoprimary",
+    )
+    if _is_atlas_uri(uri) and any(marker in detail.lower() for marker in timeout_markers):
+        detail += (
+            "\nLikely Atlas Network Access issue: check that your current public IP "
+            "is in the project's IP access list."
+        )
+    return detail
+
+
+def _check_cluster_connection(uri: str) -> tuple[bool, str]:
+    """Ping a cluster through mongosh without exposing credentials in errors."""
+    try:
+        result = subprocess.run(
+            [
+                "mongosh",
+                _check_uri(uri),
+                "--quiet",
+                "--eval",
+                "JSON.stringify(db.adminCommand({ping: 1}).ok)",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_CHECK_PROCESS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        detail = f"timed out after {_CHECK_PROCESS_TIMEOUT_SECONDS} seconds"
+        return False, _connection_error(uri, detail)
+
+    if result.returncode != 0:
+        detail = (
+            result.stderr.strip()
+            or result.stdout.strip()
+            or f"mongosh exited with code {result.returncode}"
+        )
+        return False, _connection_error(uri, detail)
+
+    try:
+        ok = json.loads(result.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        return False, "mongosh returned an unexpected response"
+    if ok != 1:
+        return False, f"ping returned ok={ok!r}"
+    return True, ""
 
 
 def _format_size(size: float) -> str:
@@ -799,6 +867,9 @@ def _cmd_check(args: argparse.Namespace) -> None:
             print(f"  - {e}", file=sys.stderr)
         sys.exit(1)
 
+    if args.connect:
+        _require_tools("mongosh")
+
     clusters = config["clusters"]
     default = config.get("default")
     print(f"{_CONFIG_PATH}: OK — {len(clusters)} cluster(s)")
@@ -809,6 +880,18 @@ def _cmd_check(args: argparse.Namespace) -> None:
             tags.append(f"protected: {', '.join(protected)}")
         suffix = f"  [{'; '.join(tags)}]" if tags else ""
         print(f"  {name}  {_redact_uri(clusters[name]['uri'])}{suffix}")
+    connection_failed = False
+    if args.connect:
+        print("connections")
+        for name in sorted(clusters):
+            connected, detail = _check_cluster_connection(clusters[name]["uri"])
+            if connected:
+                print(f"  {name}  OK")
+                continue
+            connection_failed = True
+            print(f"  {name}  FAILED", file=sys.stderr)
+            detail = detail.replace("\n", "\n    ")
+            print(f"    {detail}", file=sys.stderr)
     scripts = config.get("scripts", {})
     if scripts:
         print("scripts")
@@ -816,6 +899,8 @@ def _cmd_check(args: argparse.Namespace) -> None:
             path = _path_from(scripts[label], _CONFIG_DIR)
             suffix = "" if path.is_file() else "  [missing]"
             print(f"  {label}  {path}{suffix}")
+    if connection_failed:
+        sys.exit(1)
 
 
 def _cmd_init(args: argparse.Namespace) -> None:
@@ -932,7 +1017,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     diff.add_argument("b", help="second database (<cluster>:<db> or <db>)")
 
     sub.add_parser("init", help="create a starter config file")
-    sub.add_parser("check", help="validate the config file and list configured clusters")
+    check = sub.add_parser("check", help="validate the config file and list configured clusters")
+    check.add_argument("--connect", action="store_true", help="connect to and ping every configured cluster")
 
     return parser.parse_args(raw_argv)
 

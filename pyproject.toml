@@ -7,6 +7,11 @@ dependencies = [
     "tomli>=2.0; python_version < '3.11'",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.4.1",
+]
+
 [project.scripts]
 adbshot = "devtools.adbshot:main"
 adbw = "devtools.adbw:main"

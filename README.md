@@ -126,6 +126,7 @@ bongo snapshot main                   # gzipped archive in ~/.local/share/bongo/
 bongo snapshot                        # list snapshots
 bongo restore main                    # restore latest snapshot of main in place
 bongo restore main main-redo          # ...or into a different db (--file picks a specific snapshot)
+bongo check --connect                 # validate config and ping every configured cluster
 ```
 
 `cp`, `snapshot` and `restore` render one ✓ line per collection with doc counts (plus a live progress bar for the collection in flight, when the output is a terminal). Pass `-v` for the raw mongodump/mongorestore output. Colors respect `NO_COLOR`.
@@ -172,6 +173,8 @@ protected = []
 [scripts]
 adduser = "scripts/adduser.js" # relative to ~/.config/bongo
 ```
+
+`bongo check` validates the config structure and lists its clusters. Add `--connect` to use each configured URI with `mongosh` and ping every cluster; all clusters are checked, and the command exits nonzero if any connection fails. Checks use a five-second server-selection timeout unless the URI already specifies `serverSelectionTimeoutMS`. Timeout-style failures for Atlas clusters include a hint to check the project's Network Access IP access list.
 
 Databases listed in `protected` cannot be dropped or overwritten without `--force`. Copying onto an existing database prompts before replacing it (`-y` skips the prompt).
 
