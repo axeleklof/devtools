@@ -250,9 +250,9 @@ def _require_tools(*tools: str) -> None:
     missing = [t for t in tools if not shutil.which(t)]
     if missing:
         hints = {
-            "mongosh": "brew install mongosh",
-            "mongodump": "brew install mongodb-database-tools",
-            "mongorestore": "brew install mongodb-database-tools",
+            "mongosh": "install mongosh: https://www.mongodb.com/docs/mongodb-shell/install/",
+            "mongodump": "install MongoDB Database Tools: https://www.mongodb.com/docs/database-tools/installation/",
+            "mongorestore": "install MongoDB Database Tools: https://www.mongodb.com/docs/database-tools/installation/",
         }
         lines = [f"bongo: missing required tools: {', '.join(missing)}"]
         for hint in sorted({hints[t] for t in missing}):

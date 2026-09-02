@@ -303,12 +303,21 @@ def _extract_code_block(text: str) -> str | None:
     return "\n".join(collected).strip() if collected else None
 
 
-def _copy_to_clipboard(text: str) -> None:
+def _copy_to_clipboard(text: str) -> bool:
+    if shutil.which("pbcopy"):
+        cmd = ["pbcopy"]
+    elif shutil.which("wl-copy"):
+        cmd = ["wl-copy", "--type", "text/plain"]
+    elif shutil.which("xclip"):
+        cmd = ["xclip", "-selection", "clipboard"]
+    else:
+        return False
+
     try:
-        proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-        proc.communicate(text.encode())
+        result = subprocess.run(cmd, input=text, text=True, capture_output=True)
+        return result.returncode == 0
     except Exception:
-        pass  # clipboard failure is non-fatal
+        return False
 
 
 def _read_stdin() -> str | None:
@@ -403,8 +412,7 @@ def main(argv: list[str] | None = None) -> None:
     if mode == "cmd":
         command = _extract_code_block(response)
         if command:
-            if not args.no_clip:
-                _copy_to_clipboard(command)
+            copied = not args.no_clip and _copy_to_clipboard(command)
             hint = "(command copied to clipboard)" if args.verbose else "(copied to clipboard)"
             if args.verbose:
                 print(response)
@@ -412,12 +420,18 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"```bash\n{command}\n```")
             else:
                 print(command)
-            if args.md:
-                print(hint, file=sys.stderr)
-            elif args.verbose:
-                print(f"\n\x1b[2m{hint}\x1b[0m")
-            else:
-                print(f"\x1b[2m{hint}\x1b[0m", file=sys.stderr)
+            if copied:
+                if args.md:
+                    print(hint, file=sys.stderr)
+                elif args.verbose:
+                    print(f"\n\x1b[2m{hint}\x1b[0m")
+                else:
+                    print(f"\x1b[2m{hint}\x1b[0m", file=sys.stderr)
+            elif not args.no_clip:
+                print(
+                    "(clipboard unavailable; install wl-clipboard or xclip on Linux)",
+                    file=sys.stderr,
+                )
         else:
             print(response)
     else:

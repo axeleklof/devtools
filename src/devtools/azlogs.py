@@ -142,7 +142,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--mouse",
         action="store_true",
-        help="enable mouse scrolling in less (disables text selection without holding Option)",
+        help="enable mouse scrolling in less (use your terminal's modifier key to select text)",
     )
     parser.add_argument(
         "-f",

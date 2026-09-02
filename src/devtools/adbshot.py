@@ -11,6 +11,59 @@ from datetime import datetime
 from pathlib import Path
 
 
+def _resize_png(path: Path, height: int) -> bool:
+    if shutil.which("sips"):
+        cmd = ["sips", "--resampleHeight", str(height), str(path), "--out", str(path)]
+    elif shutil.which("magick"):
+        cmd = ["magick", str(path), "-resize", f"x{height}", str(path)]
+    elif shutil.which("convert"):
+        cmd = ["convert", str(path), "-resize", f"x{height}", str(path)]
+    else:
+        print(
+            "No image resizer found. Install ImageMagick (Linux) or use macOS sips.",
+            file=sys.stderr,
+        )
+        return False
+
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip()
+        print(f"Failed to resize screenshot: {detail}", file=sys.stderr)
+        return False
+    return True
+
+
+def _copy_png_to_clipboard(path: Path) -> bool:
+    if shutil.which("osascript"):
+        script = f'set the clipboard to (read file POSIX file "{path}" as «class PNGf»)'
+        cmd = ["osascript", "-e", script]
+        input_data = None
+    elif shutil.which("wl-copy"):
+        cmd = ["wl-copy", "--type", "image/png"]
+        input_data = path.read_bytes()
+    elif shutil.which("xclip"):
+        cmd = ["xclip", "-selection", "clipboard", "-t", "image/png", "-i"]
+        input_data = path.read_bytes()
+    else:
+        print(
+            "No clipboard tool found. Install wl-clipboard (Wayland) or xclip (X11).",
+            file=sys.stderr,
+        )
+        return False
+
+    result = subprocess.run(
+        cmd,
+        input=input_data,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip()
+        print(f"Failed to copy screenshot to clipboard: {detail}", file=sys.stderr)
+        return False
+    return True
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="adbshot",
@@ -92,16 +145,7 @@ def main(argv: list[str] | None = None) -> None:
 
         # Optional resize
         if args.lowres:
-            result = subprocess.run(
-                [
-                    "sips", "--resampleHeight", str(args.height),
-                    str(tmp_png), "--out", str(tmp_png),
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-            if result.returncode != 0:
-                print("sips resize failed", file=sys.stderr)
+            if not _resize_png(tmp_png, args.height):
                 sys.exit(1)
 
         # Save to file
@@ -125,18 +169,7 @@ def main(argv: list[str] | None = None) -> None:
         # Copy to clipboard
         clip_msg = ""
         if do_clipboard:
-            script = (
-                'set the clipboard to (read file POSIX file "'
-                + str(tmp_png)
-                + '" as «class PNGf»)'
-            )
-            result = subprocess.run(
-                ["osascript", "-e", script],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-            if result.returncode != 0:
-                print("Failed to copy to clipboard", file=sys.stderr)
+            if not _copy_png_to_clipboard(tmp_png):
                 sys.exit(1)
             clip_msg = "Copied to clipboard"
 

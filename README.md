@@ -1,6 +1,6 @@
 # devtools
 
-Collection of CLI tools I use to make my life easier. macOS only.
+Collection of CLI tools I use to make my life easier. Supports macOS and Linux.
 
 ## Install
 
@@ -45,6 +45,9 @@ Run tools with `uv run <tool>` or activate the venv first.
 ### adbshot
 
 Capture screenshots from a connected Android device via `adb`.
+
+Clipboard output uses the native macOS clipboard, `wl-copy` on Wayland, or
+`xclip` on X11. Low-resolution output requires ImageMagick on Linux.
 
 ```bash
 adbshot                        # copy to clipboard at full resolution
@@ -107,7 +110,7 @@ In follow mode (`-f`), `Ctrl+C` pauses following so you can scroll back, `F` res
 
 Copy, list and drop MongoDB databases across configured clusters — a thin wrapper over `mongodump`/`mongorestore`. Handy for cloning a base database before testing a PR with destructive migrations.
 
-Requires `mongosh` and the MongoDB database tools (`brew install mongosh mongodb-database-tools`).
+Requires `mongosh` and the [MongoDB Database Tools](https://www.mongodb.com/docs/database-tools/installation/).
 
 ```bash
 bongo init                            # create a starter config
@@ -192,7 +195,11 @@ cat error.log | oneshot "what's wrong here"              # pipe content as conte
 git diff | oneshot -v "summarise these changes"
 ```
 
-In command mode the command is automatically copied to your clipboard. Useful aliases:
+In command mode the command is automatically copied to your clipboard when a
+supported clipboard tool is available. Useful aliases:
+
+On Linux, clipboard copying requires `wl-copy` from `wl-clipboard` on Wayland or
+`xclip` on X11.
 
 ```bash
 alias osc='oneshot'
@@ -236,7 +243,7 @@ Each request includes a system prompt with the following context collected at in
 
 | Field | Value | Example |
 |---|---|---|
-| OS | macOS version | `macOS 15.4` |
+| OS | Operating system and version when available | `macOS 15.4` or `Linux` |
 | Shell | Name and version | `zsh 5.9` |
 | Working directory | Basename only (not full path) | `devtools` |
 | Git context | Whether cwd is inside a git repo | `in git repo` |
