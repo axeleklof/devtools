@@ -314,7 +314,13 @@ def _copy_to_clipboard(text: str) -> bool:
         return False
 
     try:
-        result = subprocess.run(cmd, input=text, text=True, capture_output=True)
+        result = subprocess.run(
+            cmd,
+            input=text,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         return result.returncode == 0
     except Exception:
         return False

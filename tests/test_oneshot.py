@@ -25,6 +25,8 @@ def test_copy_to_clipboard_uses_pbcopy_when_available(
     assert oneshot._copy_to_clipboard("ls -la") is True
     assert invocation["cmd"] == ["pbcopy"]
     assert invocation["input"] == "ls -la"
+    assert invocation["stdout"] is subprocess.DEVNULL
+    assert invocation["stderr"] is subprocess.DEVNULL
 
 
 def test_copy_to_clipboard_uses_xclip(
