@@ -117,3 +117,167 @@ uri = "mongodb://second.example.test"
     ]
     assert "second  OK" in captured.out
     assert "first  FAILED" in captured.err
+
+
+def test_cat_terms_build_query_and_words() -> None:
+    conditions, words = bongo._parse_cat_terms(
+        ["Axel", "role=admin", "age>30", "name~^ax", "zip!=12345", "address.city=Stockholm"]
+    )
+
+    assert words == ["axel"]
+    assert conditions == [
+        {"role": {"$in": ["admin"]}},
+        {"age": {"$gt": 30}},
+        {"name": {"$regex": "^ax", "$options": "i"}},
+        {"zip": {"$nin": [12345, "12345"]}},
+        {"address.city": {"$in": ["Stockholm"]}},
+    ]
+
+
+def test_cat_terms_infer_ids_dates_and_literals() -> None:
+    oid = "65f1c0ffee65f1c0ffee65f1"
+    conditions, words = bongo._parse_cat_terms(
+        [oid, f"owner={oid}", "active=true", "createdAt>=2026-01-01", "seen<2026-01-01T12:30"]
+    )
+
+    assert words == []
+    assert conditions == [
+        {"_id": {"$in": [{"$oid": oid}, oid]}},
+        {"owner": {"$in": [{"$oid": oid}, oid]}},
+        {"active": {"$in": [True]}},
+        {"createdAt": {"$gte": {"$date": "2026-01-01T00:00:00Z"}}},
+        {"seen": {"$lt": {"$date": "2026-01-01T12:30:00Z"}}},
+    ]
+
+
+def test_cat_plain_words_and_projection() -> None:
+    doc = bongo._plain(
+        {
+            "_id": {"$oid": "65f1c0ffee65f1c0ffee65f1"},
+            "name": "Axel Eklöf",
+            "created": {"$date": "2026-01-01T00:00:00Z"},
+            "address": {"city": "Stockholm", "zip": 12345},
+            "tags": ["Admin"],
+        }
+    )
+
+    assert doc["_id"] == "65f1c0ffee65f1c0ffee65f1"
+    assert doc["created"] == "2026-01-01T00:00:00Z"
+    assert bongo._matches_words(doc, ["axel", "admin", "1234"])
+    assert not bongo._matches_words(doc, ["axel", "name"])  # keys are not searched
+    assert bongo._project(doc, ["address.city", "missing"]) == {
+        "_id": "65f1c0ffee65f1c0ffee65f1",
+        "address": {"city": "Stockholm"},
+    }
+
+
+def test_cat_args_allow_flags_anywhere() -> None:
+    args = bongo.parse_args(["cat", "main", "users", "-n", "all", "axel", "-r", "role=admin"])
+
+    assert args.command == "cat"
+    assert (args.database, args.collection) == ("main", "users")
+    assert args.terms == ["axel", "role=admin"]
+    assert args.limit == "all"
+    assert args.reverse is True
+    assert bongo.parse_args(["cat", "main", "users", "-n", "3"]).limit == 3
+
+
+class _FakeExport:
+    def __init__(self, lines: list[str]) -> None:
+        self.stdout = iter(lines)
+
+    def wait(self) -> int:
+        return 0
+
+    def kill(self) -> None:
+        pass
+
+
+def _run_cat(monkeypatch: pytest.MonkeyPatch, docs: int, argv: list[str]) -> list[str]:
+    commands: list[list[str]] = []
+
+    def popen(cmd, **kwargs):
+        commands.append(cmd)
+        return _FakeExport([f'{{"_id": {{"$oid": "{i:024x}"}}, "name": "user{i}"}}\n' for i in range(docs)])
+
+    monkeypatch.setattr(bongo.subprocess, "Popen", popen)
+    config = {"default": "local", "clusters": {"local": {"uri": "mongodb://localhost:27017"}}}
+    bongo._cmd_cat(config, bongo.parse_args(["cat", *argv]))
+    return commands[0]
+
+
+def test_cat_limits_output_and_warns_on_stderr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    command = _run_cat(monkeypatch, 25, ["main", "users"])
+
+    captured = capsys.readouterr()
+    assert len(captured.out.splitlines()) == 10
+    assert captured.out.splitlines()[0] == '{"_id": "000000000000000000000000", "name": "user0"}'
+    assert "first 10 documents" in captured.err
+    assert "--limit=11" in command
+
+
+def test_cat_all_prints_everything_without_warning(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    command = _run_cat(monkeypatch, 25, ["main", "users", "-n", "all"])
+
+    captured = capsys.readouterr()
+    assert len(captured.out.splitlines()) == 25
+    assert captured.err == ""
+    assert not any(arg.startswith("--limit") for arg in command)
+
+
+def test_cat_bare_word_filters_client_side(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    command = _run_cat(monkeypatch, 25, ["main", "users", "USER2", "-c"])
+
+    assert capsys.readouterr().out.strip() == "6"  # user2, user20..user24
+    assert not any(arg.startswith(("--limit", "--fields")) for arg in command)
+
+
+def test_cat_explicit_limit_does_not_warn(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _run_cat(monkeypatch, 25, ["main", "users", "-n", "3"])
+
+    captured = capsys.readouterr()
+    assert len(captured.out.splitlines()) == 3
+    assert captured.err == ""
+
+
+def test_cat_exclude_and_depth() -> None:
+    doc = {
+        "_id": "1",
+        "name": "Axel",
+        "logins": [{"ip": "1.1.1.1", "at": "x"}, {"ip": "2.2.2.2", "at": "y"}],
+        "address": {"city": "Stockholm", "geo": {"lat": 1, "lon": 2}},
+        "empty": [],
+    }
+
+    bongo._exclude(doc, ["logins", "ip"])
+    bongo._exclude(doc, ["name"])
+    bongo._exclude(doc, ["missing", "deeper"])
+    assert doc["logins"] == [{"at": "x"}, {"at": "y"}]
+    assert "name" not in doc
+
+    assert bongo._collapse(doc, 1) == {
+        "_id": "1",
+        "logins": "[… 2 items]",
+        "address": "{… 2 fields}",
+        "empty": [],
+    }
+    assert bongo._collapse(doc, 2)["address"] == {"city": "Stockholm", "geo": "{… 2 fields}"}
+    assert bongo._render_json(bongo._collapse(doc, 1)["logins"]) == "[… 2 items]"
+
+
+def test_cat_exclude_and_depth_flags(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _run_cat(monkeypatch, 1, ["main", "users", "-x", "_id,name"])
+    assert capsys.readouterr().out.strip() == "{}"
+
+    with pytest.raises(SystemExit):
+        bongo.parse_args(["cat", "main", "users", "-d", "0"])

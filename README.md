@@ -121,6 +121,8 @@ bongo sh                              # mongosh shell on the default cluster (or
 bongo run adduser pr-539              # run a configured JavaScript script on a database
 bongo run ./fix.js atlas-dev:staging  # run a one-off script file
 bongo diff main pr-539                # compare collections, doc counts and indexes
+bongo cat main users                  # print documents (first 10; -n all for everything)
+bongo cat main users axel role=admin  # ...filtered: 'axel' anywhere, and role equal to admin
 bongo ls                              # list databases on the default cluster (with sizes)
 bongo ls atlas-dev
 bongo rm pr-539                       # drop a database (asks for confirmation)
@@ -159,6 +161,24 @@ For local helper scripts, put files under `~/.config/bongo/scripts` and add labe
 bongo run adduser main
 bongo run adduser main -- --script-specific-option value
 ```
+
+`bongo cat DATABASE COLLECTION [TERM...]` prints documents, filtered by terms that are ANDed together:
+
+```bash
+bongo cat main users axel                 # bare word: case-insensitive match in any value
+bongo cat main users name~axel            # field matches a case-insensitive regex
+bongo cat main users role=admin           # equals (also !=)
+bongo cat main users 'age>30'             # > >= < <= (quote them for the shell)
+bongo cat main users 'createdAt>=2026-01-01'
+bongo cat main users 65f1c0ffee65f1c0ffee65f1   # bare 24-hex word: _id lookup
+bongo cat main users address.city=Stockholm -f name,email
+bongo cat main users -r -n 1              # newest document
+bongo cat main users -x loginHistory,address.zip   # everything but these fields
+bongo cat main users -d 1                 # collapse nested values: "tags": [… 2 items]
+bongo cat dev:main users -n all | jq .email
+```
+
+Values are typed for you: `true`/`false`/`null`, ObjectIds, ISO dates, and numbers (`zip=12345` matches both `12345` and `"12345"`). Flags: `-n N|all` (default 10, with a notice on stderr when more match), `-s FIELD` sort, `-r` descending (by `_id` without `-s`), `-f a,b` fields, `-x a,b` exclude fields, `-d N` collapse anything nested deeper than N levels into a placeholder (a string like `"{… 3 fields}"` when piped), `-c` count, `-q JSON` raw query. Output is pretty-printed and colored on a terminal, and one JSON document per line when piped; ObjectIds and dates are printed as plain strings. Bare words are matched client-side, so on a large remote collection prefer `field~word`. Requires `mongoexport` from the Database Tools.
 
 Databases are addressed as `<cluster>:<db>`; a bare `<db>` uses the default cluster. Clusters are defined in `~/.config/bongo/config.toml`:
 

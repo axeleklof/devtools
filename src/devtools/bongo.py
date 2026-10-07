@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from collections import deque
 from datetime import datetime
@@ -253,6 +254,7 @@ def _require_tools(*tools: str) -> None:
             "mongosh": "install mongosh: https://www.mongodb.com/docs/mongodb-shell/install/",
             "mongodump": "install MongoDB Database Tools: https://www.mongodb.com/docs/database-tools/installation/",
             "mongorestore": "install MongoDB Database Tools: https://www.mongodb.com/docs/database-tools/installation/",
+            "mongoexport": "install MongoDB Database Tools: https://www.mongodb.com/docs/database-tools/installation/",
         }
         lines = [f"bongo: missing required tools: {', '.join(missing)}"]
         for hint in sorted({hints[t] for t in missing}):
@@ -913,8 +915,295 @@ def _cmd_init(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# cat — print documents, filtered by short positional terms
+# ---------------------------------------------------------------------------
+
+_CAT_DEFAULT_LIMIT = 10
+_CAT_TERM_RE = re.compile(r"^([A-Za-z_$][\w.$-]*)(!=|>=|<=|=|~|>|<)(.*)$", re.DOTALL)
+_CAT_RANGE_OPS = {">": "$gt", ">=": "$gte", "<": "$lt", "<=": "$lte"}
+_OBJECT_ID_RE = re.compile(r"^[0-9a-fA-F]{24}$")
+_NUMBER_RE = re.compile(r"^-?\d+(\.\d+)?$")
+_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2})(:\d{2}(?:\.\d+)?)?)?(Z|[+-]\d{2}:\d{2})?$")
+
+
+def _cat_values(raw: str) -> list:
+    """Every typed value a hand-written term could mean, most specific first ('42' -> [42, '42'])."""
+    if raw in ("true", "false", "null"):
+        return [json.loads(raw)]
+    if _OBJECT_ID_RE.match(raw):
+        return [{"$oid": raw}, raw]
+    if _NUMBER_RE.match(raw):
+        return [float(raw) if "." in raw else int(raw), raw]
+    date = _DATE_RE.match(raw)
+    if date:
+        day, time, seconds, zone = date.groups()
+        return [{"$date": f"{day}T{time or '00:00'}{seconds or ':00'}{zone or 'Z'}"}, raw]
+    return [raw]
+
+
+def _parse_cat_terms(terms: list[str]) -> tuple[list[dict], list[str]]:
+    """Split terms into server-side query conditions and bare words matched client-side."""
+    conditions: list[dict] = []
+    words: list[str] = []
+    for term in terms:
+        match = _CAT_TERM_RE.match(term)
+        if match:
+            field, op, raw = match.groups()
+            if op == "~":
+                condition = {"$regex": raw, "$options": "i"}
+            elif op in _CAT_RANGE_OPS:
+                condition = {_CAT_RANGE_OPS[op]: _cat_values(raw)[0]}
+            else:
+                condition = {"$in" if op == "=" else "$nin": _cat_values(raw)}
+            conditions.append({field: condition})
+        elif _OBJECT_ID_RE.match(term):
+            conditions.append({"_id": {"$in": _cat_values(term)}})
+        else:
+            words.append(term.lower())
+    return conditions, words
+
+
+def _plain(value):
+    """Collapse extended-JSON wrappers ({"$oid": ...}, {"$date": ...}) into plain strings."""
+    if isinstance(value, dict):
+        if len(value) == 1:
+            (key, inner), = value.items()
+            if key in ("$oid", "$date") and isinstance(inner, str):
+                return inner
+        return {k: _plain(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_plain(v) for v in value]
+    return value
+
+
+def _leaves(value):
+    if isinstance(value, dict):
+        for inner in value.values():
+            yield from _leaves(inner)
+    elif isinstance(value, list):
+        for inner in value:
+            yield from _leaves(inner)
+    else:
+        yield value
+
+
+def _matches_words(doc: dict, words: list[str]) -> bool:
+    """True if every word is a case-insensitive substring of some value in the document."""
+    texts = [str(leaf).lower() for leaf in _leaves(doc)]
+    return all(any(word in text for text in texts) for word in words)
+
+
+def _project(doc: dict, fields: list[str]) -> dict:
+    """Keep _id plus the given (optionally dotted) fields."""
+    out = {"_id": doc["_id"]} if "_id" in doc else {}
+    for field in fields:
+        src, dst = doc, out
+        parts = field.split(".")
+        for part in parts[:-1]:
+            src = src.get(part)
+            if not isinstance(src, dict):
+                break
+            dst = dst.setdefault(part, {})
+        else:
+            if parts[-1] in src:
+                dst[parts[-1]] = src[parts[-1]]
+    return out
+
+
+def _exclude(value, path: list[str]) -> None:
+    """Remove a (dotted) field in place, reaching through arrays of documents."""
+    if isinstance(value, list):
+        for inner in value:
+            _exclude(inner, path)
+    elif isinstance(value, dict):
+        if len(path) == 1:
+            value.pop(path[0], None)
+        elif path[0] in value:
+            _exclude(value[path[0]], path[1:])
+
+
+class _Collapsed(str):
+    """Placeholder for a nested value cut off by --depth; still a JSON string when piped."""
+
+
+def _collapse(value, depth: int):
+    """Replace non-empty objects/arrays nested deeper than `depth` levels with a placeholder."""
+    if isinstance(value, dict) and value:
+        if depth == 0:
+            return _Collapsed(f"{{… {len(value)} field{'s' if len(value) != 1 else ''}}}")
+        return {k: _collapse(v, depth - 1) for k, v in value.items()}
+    if isinstance(value, list) and value:
+        if depth == 0:
+            return _Collapsed(f"[… {len(value)} item{'s' if len(value) != 1 else ''}]")
+        return [_collapse(v, depth - 1) for v in value]
+    return value
+
+
+def _render_json(value, depth: int = 0) -> str:
+    """Pretty-print JSON, colored when stdout is a terminal."""
+    pad, end = "  " * (depth + 1), "  " * depth
+    if isinstance(value, dict) and value:
+        items = [
+            f"{pad}{_c('34', json.dumps(k, ensure_ascii=False))}: {_render_json(v, depth + 1)}"
+            for k, v in value.items()
+        ]
+        return "{\n" + ",\n".join(items) + f"\n{end}}}"
+    if isinstance(value, list) and value:
+        items = [f"{pad}{_render_json(v, depth + 1)}" for v in value]
+        return "[\n" + ",\n".join(items) + f"\n{end}]"
+    if isinstance(value, _Collapsed):
+        return _c("2", value)
+    text = json.dumps(value, ensure_ascii=False)
+    if isinstance(value, str):
+        return _c("32", text)
+    if value is None or isinstance(value, bool):
+        return _c("35", text)
+    if isinstance(value, (int, float)):
+        return _c("33", text)
+    return text
+
+
+def _cmd_cat(config: dict, args: argparse.Namespace) -> None:
+    cluster_name, db = _resolve_address(config, args.database)
+    uri = config["clusters"][cluster_name]["uri"]
+
+    conditions, words = _parse_cat_terms(args.terms)
+    if args.query:
+        try:
+            conditions.append(json.loads(args.query))
+        except json.JSONDecodeError as e:
+            sys.exit(f"bongo: -q is not valid JSON: {e}")
+    query = conditions[0] if len(conditions) == 1 else {"$and": conditions} if conditions else {}
+    limit = None if args.count or args.limit == "all" else args.limit or _CAT_DEFAULT_LIMIT
+    sort_field = args.sort or ("_id" if args.reverse else None)
+    fields = [f for f in (args.fields or "").split(",") if f]
+    excluded = [f.split(".") for f in (args.exclude or "").split(",") if f]
+
+    cmd = [
+        "mongoexport", f"--uri={uri}", f"--db={db}", f"--collection={args.collection}",
+        f"--query={json.dumps(query)}",
+    ]
+    if sort_field:
+        cmd.append(f"--sort={json.dumps({sort_field: -1 if args.reverse else 1})}")
+    if not words:
+        # Bare words are matched client-side, so only without them can the server limit and trim.
+        if limit is not None:
+            cmd.append(f"--limit={limit + 1}")
+        if args.count:
+            cmd.append("--fields=_id")
+
+    pretty = sys.stdout.isatty()
+    shown, more = 0, False
+    # mongoexport logs to stderr; keep it in a file (a pipe could fill up) and show it only on failure.
+    log = tempfile.TemporaryFile("w+")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log, text=True)
+    try:
+        for line in proc.stdout:
+            doc = _plain(json.loads(line))
+            if words and not _matches_words(doc, words):
+                continue
+            if shown == limit:
+                more = True
+                break
+            shown += 1
+            if args.count:
+                continue
+            if fields:
+                doc = _project(doc, fields)
+            for path in excluded:
+                _exclude(doc, path)
+            if args.depth:
+                doc = _collapse(doc, args.depth)
+            print(_render_json(doc) if pretty else json.dumps(doc, ensure_ascii=False))
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # Downstream (head, jq ...) closed early; point stdout at devnull so exit doesn't complain.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        proc.kill()
+        return
+    if more:
+        proc.kill()
+        proc.wait()
+    else:
+        if proc.wait() != 0:
+            log.seek(0)
+            # Last log line, minus its timestamp, is the actual error.
+            detail = (log.read().strip().splitlines() or ["no output"])[-1].split("\t", 1)[-1]
+            sys.exit(f"bongo: mongoexport failed: {detail.replace(uri, _redact_uri(uri))}")
+
+    if args.count:
+        print(shown)
+    elif more and args.limit is None:
+        # Only for the implicit limit, and on stderr so the notice never ends up in a pipe.
+        print(f"bongo: showing the first {limit} documents, more match — use -n all for everything", file=sys.stderr)
+    elif shown == 0:
+        names = _mongosh_json(uri, f"db.getSiblingDB({json.dumps(db)}).getCollectionNames()")
+        if args.collection not in names:
+            sys.exit(
+                f"bongo: no collection '{args.collection}' in '{cluster_name}:{db}'"
+                f" (collections: {', '.join(sorted(names)) or 'none'})"
+            )
+        print("bongo: no documents match", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def _cat_limit(value: str) -> int | str:
+    if value == "all":
+        return value
+    if not value.isdigit() or int(value) < 1:
+        raise argparse.ArgumentTypeError("expected a positive number or 'all'")
+    return int(value)
+
+
+def _cat_depth(value: str) -> int:
+    if not value.isdigit() or int(value) < 1:
+        raise argparse.ArgumentTypeError("expected a positive number")
+    return int(value)
+
+
+def _add_cat_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("database", help="database (<cluster>:<db> or <db>)")
+    parser.add_argument("collection", help="collection to print")
+    parser.add_argument("terms", nargs="*", metavar="TERM", help="bare word (matches anywhere) or field=, !=, ~, >, >=, <, <= value")
+    parser.add_argument("-n", dest="limit", type=_cat_limit, metavar="N",
+                        help=f"print at most N documents, or 'all' (default: {_CAT_DEFAULT_LIMIT})")
+    parser.add_argument("-s", "--sort", metavar="FIELD", help="sort by a field")
+    parser.add_argument("-r", "--reverse", action="store_true", help="sort descending (by _id, newest first, without -s)")
+    parser.add_argument("-f", "--fields", metavar="A,B", help="only print these fields (plus _id)")
+    parser.add_argument("-x", "--exclude", metavar="A,B", help="leave these fields out")
+    parser.add_argument("-d", "--depth", type=_cat_depth, metavar="N",
+                        help="collapse objects and arrays nested deeper than N levels (1 = top-level fields only)")
+    parser.add_argument("-c", "--count", action="store_true", help="print the number of matching documents instead")
+    parser.add_argument("-q", "--query", metavar="JSON", help="raw MongoDB query (extended JSON), ANDed with the terms")
+
+
+def _parse_cat_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="bongo cat",
+        description="Print documents from a collection, optionally filtered. Terms are ANDed.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  bongo cat main users                   # first 10 documents\n"
+            "  bongo cat main users axel              # 'axel' anywhere in the document\n"
+            "  bongo cat main users name~axel         # field matches (case-insensitive regex)\n"
+            "  bongo cat main users role=admin 'age>30'\n"
+            "  bongo cat main users 65f1c0ffee65f1c0ffee65f1   # by _id\n"
+            "  bongo cat main users -r -n 1           # newest document\n"
+            "  bongo cat main users -x loginHistory   # everything but a noisy field\n"
+            "  bongo cat main users -d 1              # nested objects/arrays collapsed\n"
+            "  bongo cat dev:main users -n all | jq .email\n"
+        ),
+    )
+    _add_cat_arguments(parser)
+    # Intermixed, so flags may come before, between or after the terms.
+    args = parser.parse_intermixed_args(argv)
+    args.command = "cat"
+    return args
+
 
 def _parse_run_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="bongo run", description="Run a mongosh JavaScript file on a database.")
@@ -942,6 +1231,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     raw_argv = sys.argv[1:] if argv is None else argv
     if raw_argv[:1] == ["run"]:
         return _parse_run_args(raw_argv[1:])
+    if raw_argv[:1] == ["cat"]:
+        return _parse_cat_args(raw_argv[1:])
 
     parser = argparse.ArgumentParser(
         prog="bongo",
@@ -957,6 +1248,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  bongo sh                          # mongosh shell on the default cluster\n"
             "  bongo run adduser pr-539          # run a configured script label on a database\n"
             "  bongo run ./fix.js atlas-dev:main # run a one-off script file\n"
+            "  bongo cat main users axel         # print documents mentioning 'axel' (see: bongo cat -h)\n"
             "  bongo diff main pr-539            # collection/count/index differences\n"
             "  bongo ls                          # databases on the default cluster\n"
             "  bongo ls atlas-dev\n"
@@ -1012,6 +1304,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run.add_argument("--dry-run", action="store_true", help="set globalThis.bongo.dryRun and globalThis.dryRun")
     run.add_argument("script_args", nargs="*", metavar="ARG", help="arguments exposed as globalThis.bongo.args")
 
+    cat = sub.add_parser("cat", help="print documents from a collection, with simple filters")
+    _add_cat_arguments(cat)
+
     diff = sub.add_parser("diff", help="compare two databases (collections, doc counts, indexes)")
     diff.add_argument("a", help="first database (<cluster>:<db> or <db>)")
     diff.add_argument("b", help="second database (<cluster>:<db> or <db>)")
@@ -1063,3 +1358,6 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "diff":
         _require_tools("mongosh")
         _cmd_diff(config, args)
+    elif args.command == "cat":
+        _require_tools("mongosh", "mongoexport")
+        _cmd_cat(config, args)
