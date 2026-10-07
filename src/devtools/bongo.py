@@ -941,16 +941,24 @@ def _cat_values(raw: str) -> list:
     return [raw]
 
 
-def _parse_cat_terms(terms: list[str]) -> tuple[list[dict], list[str]]:
-    """Split terms into server-side query conditions and bare words matched client-side."""
+def _parse_cat_terms(terms: list[str]) -> tuple[list[dict], list[str], list[tuple]]:
+    """Split terms into server-side query conditions and bare words matched client-side.
+
+    Also returns what to highlight in the output, as (field or None for any field, pattern).
+    """
     conditions: list[dict] = []
     words: list[str] = []
+    highlights: list[tuple[str | None, re.Pattern]] = []
     for term in terms:
         match = _CAT_TERM_RE.match(term)
         if match:
             field, op, raw = match.groups()
             if op == "~":
                 condition = {"$regex": raw, "$options": "i"}
+                try:
+                    highlights.append((field, re.compile(raw, re.IGNORECASE)))
+                except re.error:
+                    pass  # valid for MongoDB (PCRE) but not for Python: still filters, just no highlight
             elif op in _CAT_RANGE_OPS:
                 condition = {_CAT_RANGE_OPS[op]: _cat_values(raw)[0]}
             else:
@@ -960,7 +968,8 @@ def _parse_cat_terms(terms: list[str]) -> tuple[list[dict], list[str]]:
             conditions.append({"_id": {"$in": _cat_values(term)}})
         else:
             words.append(term.lower())
-    return conditions, words
+            highlights.append((None, re.compile(re.escape(term), re.IGNORECASE)))
+    return conditions, words, highlights
 
 
 def _plain(value):
@@ -1039,27 +1048,50 @@ def _collapse(value, depth: int):
     return value
 
 
-def _render_json(value, depth: int = 0) -> str:
-    """Pretty-print JSON, colored when stdout is a terminal."""
+def _highlight(raw: str, code: str, patterns: list[re.Pattern], encode=str) -> str:
+    """Color `raw`, with every match of the patterns standing out."""
+    spans: list[list[int]] = []
+    for start, end in sorted(m.span() for p in patterns for m in p.finditer(raw) if m.end() > m.start()):
+        if spans and start <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], end)
+        else:
+            spans.append([start, end])
+    out, pos = [], 0
+    for start, end in spans:
+        if start > pos:
+            out.append(_c(code, encode(raw[pos:start])))
+        out.append(_c("30;43", encode(raw[start:end])))
+        pos = end
+    if pos < len(raw):
+        out.append(_c(code, encode(raw[pos:])))
+    return "".join(out)
+
+
+def _render_json(value, depth: int = 0, highlights: list[tuple] = (), path: str = "") -> str:
+    """Pretty-print JSON, colored when stdout is a terminal, with highlighted search matches."""
     pad, end = "  " * (depth + 1), "  " * depth
     if isinstance(value, dict) and value:
         items = [
-            f"{pad}{_c('34', json.dumps(k, ensure_ascii=False))}: {_render_json(v, depth + 1)}"
+            f"{pad}{_c('34', json.dumps(k, ensure_ascii=False))}: "
+            + _render_json(v, depth + 1, highlights, f"{path}.{k}" if path else k)
             for k, v in value.items()
         ]
         return "{\n" + ",\n".join(items) + f"\n{end}}}"
     if isinstance(value, list) and value:
-        items = [f"{pad}{_render_json(v, depth + 1)}" for v in value]
+        items = [f"{pad}{_render_json(v, depth + 1, highlights, path)}" for v in value]
         return "[\n" + ",\n".join(items) + f"\n{end}]"
     if isinstance(value, _Collapsed):
         return _c("2", value)
+    patterns = [pattern for field, pattern in highlights if field in (None, path)]
     text = json.dumps(value, ensure_ascii=False)
     if isinstance(value, str):
-        return _c("32", text)
+        # Match against the raw string, then JSON-escape each piece, so anchors and escapes stay right.
+        inner = _highlight(value, "32", patterns, lambda piece: json.dumps(piece, ensure_ascii=False)[1:-1])
+        return _c("32", '"') + inner + _c("32", '"')
     if value is None or isinstance(value, bool):
-        return _c("35", text)
+        return _highlight(text, "35", patterns)
     if isinstance(value, (int, float)):
-        return _c("33", text)
+        return _highlight(text, "33", patterns)
     return text
 
 
@@ -1067,7 +1099,7 @@ def _cmd_cat(config: dict, args: argparse.Namespace) -> None:
     cluster_name, db = _resolve_address(config, args.database)
     uri = config["clusters"][cluster_name]["uri"]
 
-    conditions, words = _parse_cat_terms(args.terms)
+    conditions, words, highlights = _parse_cat_terms(args.terms)
     if args.query:
         try:
             conditions.append(json.loads(args.query))
@@ -1114,7 +1146,7 @@ def _cmd_cat(config: dict, args: argparse.Namespace) -> None:
                 _exclude(doc, path)
             if args.depth:
                 doc = _collapse(doc, args.depth)
-            print(_render_json(doc) if pretty else json.dumps(doc, ensure_ascii=False))
+            print(_render_json(doc, highlights=highlights) if pretty else json.dumps(doc, ensure_ascii=False))
         sys.stdout.flush()
     except BrokenPipeError:
         # Downstream (head, jq ...) closed early; point stdout at devnull so exit doesn't complain.

@@ -120,7 +120,7 @@ uri = "mongodb://second.example.test"
 
 
 def test_cat_terms_build_query_and_words() -> None:
-    conditions, words = bongo._parse_cat_terms(
+    conditions, words, _ = bongo._parse_cat_terms(
         ["Axel", "role=admin", "age>30", "name~^ax", "zip!=12345", "address.city=Stockholm"]
     )
 
@@ -136,7 +136,7 @@ def test_cat_terms_build_query_and_words() -> None:
 
 def test_cat_terms_infer_ids_dates_and_literals() -> None:
     oid = "65f1c0ffee65f1c0ffee65f1"
-    conditions, words = bongo._parse_cat_terms(
+    conditions, words, _ = bongo._parse_cat_terms(
         [oid, f"owner={oid}", "active=true", "createdAt>=2026-01-01", "seen<2026-01-01T12:30"]
     )
 
@@ -281,3 +281,23 @@ def test_cat_exclude_and_depth_flags(
 
     with pytest.raises(SystemExit):
         bongo.parse_args(["cat", "main", "users", "-d", "0"])
+
+
+def test_cat_highlights_search_matches(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bongo, "_c", lambda code, text: f"<{text}>" if code == "30;43" else text)
+    _, _, highlights = bongo._parse_cat_terms(["axel", "email~^AX", "note~(unclosed", "role=admin"])
+    doc = {
+        "name": "Axel \"axe\" Axelsson",
+        "email": "axel@x.com",
+        "role": "admin",
+        "friends": [{"email": "max@x.com"}],
+        "age": 23,
+    }
+
+    rendered = bongo._render_json(doc, highlights=highlights)
+
+    assert '"name": "<Axel> \\"axe\\" <Axel>sson"' in rendered
+    assert '"email": "<axel>@x.com"' in rendered  # bare word and ^AX overlap into one span
+    assert '"email": "max@x.com"' in rendered  # the regex only applies to the top-level email field
+    assert '"role": "admin"' in rendered
+    assert bongo._render_json({"age": 23}, highlights=bongo._parse_cat_terms(["23"])[2]) == '{\n  "age": <23>\n}'
