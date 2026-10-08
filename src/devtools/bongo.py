@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -141,18 +143,29 @@ def _get_cluster(config: dict, name: str) -> dict:
     return cluster
 
 
-def _git_branch_db() -> str:
-    """Return the current git branch name sanitized into a valid db name."""
+def _git_branch() -> str | None:
+    """Return the current git branch name ('HEAD' when detached), or None outside a repository."""
     try:
-        branch = subprocess.check_output(
+        return subprocess.check_output(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             stderr=subprocess.DEVNULL, text=True, timeout=5,
         ).strip()
     except Exception:
+        return None
+
+
+def _branch_db(branch: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "-", branch)[:63]
+
+
+def _git_branch_db() -> str:
+    """Return the current git branch name sanitized into a valid db name."""
+    branch = _git_branch()
+    if branch is None:
         sys.exit("bongo: '.' requires being inside a git repository")
     if branch == "HEAD":
         sys.exit("bongo: '.' cannot resolve a branch name (detached HEAD)")
-    db = re.sub(r"[^A-Za-z0-9_-]", "-", branch)[:63]
+    db = _branch_db(branch)
     print(f"Resolved '.' -> '{db}' (branch {branch})")
     return db
 
@@ -262,12 +275,12 @@ def _require_tools(*tools: str) -> None:
         sys.exit("\n".join(lines))
 
 
-def _mongosh_json(uri: str, expression: str):
+def _mongosh_json(uri: str, expression: str, timeout: float = 30):
     """Evaluate a JS expression via mongosh and return its JSON-parsed result."""
     try:
         out = subprocess.check_output(
             ["mongosh", uri, "--quiet", "--eval", f"JSON.stringify({expression})"],
-            stderr=subprocess.PIPE, text=True, timeout=30,
+            stderr=subprocess.PIPE, text=True, timeout=timeout,
         )
     except subprocess.CalledProcessError as e:
         detail = (e.stderr or "").strip() or (e.output or "").strip()
@@ -1275,13 +1288,7 @@ def _parse_run_args(argv: list[str]) -> argparse.Namespace:
     return args
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    raw_argv = sys.argv[1:] if argv is None else argv
-    if raw_argv[:1] == ["run"]:
-        return _parse_run_args(raw_argv[1:])
-    if raw_argv[:1] == ["cat"]:
-        return _parse_cat_args(raw_argv[1:])
-
+def _build_parser() -> tuple[argparse.ArgumentParser, argparse._SubParsersAction]:
     parser = argparse.ArgumentParser(
         prog="bongo",
         description="Copy, list and drop MongoDB databases across configured clusters.",
@@ -1363,12 +1370,229 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     sub.add_parser("init", help="create a starter config file")
     check = sub.add_parser("check", help="validate the config file and list configured clusters")
     check.add_argument("--connect", action="store_true", help="connect to and ping every configured cluster")
+    completion = sub.add_parser("completion", help="print a shell completion script")
+    completion.add_argument("shell", choices=["zsh"], help="shell to generate completions for")
 
-    return parser.parse_args(raw_argv)
+    return parser, sub
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    raw_argv = sys.argv[1:] if argv is None else argv
+    if raw_argv[:1] == ["run"]:
+        return _parse_run_args(raw_argv[1:])
+    if raw_argv[:1] == ["cat"]:
+        return _parse_cat_args(raw_argv[1:])
+    return _build_parser()[0].parse_args(raw_argv)
+
+
+# ---------------------------------------------------------------------------
+# Shell completion
+# ---------------------------------------------------------------------------
+
+_COMPLETE_CACHE_PATH = Path.home() / ".cache" / "bongo" / "completion.json"
+_COMPLETE_TTL_SECONDS = 60
+_COMPLETE_FAILURE_TTL_SECONDS = 15
+_COMPLETE_TIMEOUT_SECONDS = 3
+_COMPLETE_FILES = ":files"  # tells the shell to complete file paths
+
+# What each positional of a subcommand completes to.
+_COMPLETE_POSITIONALS = {
+    "cp": ["db", "db"],
+    "rm": ["db"],
+    "ls": ["db"],
+    "prune": ["cluster"],
+    "snapshot": ["db"],
+    "restore": ["snapshot", "db"],
+    "sh": ["db"],
+    "run": ["script", "db"],
+    "cat": ["db", "collection"],
+    "diff": ["db", "db"],
+    "completion": ["shell"],
+}
+
+# Commands that may add or remove databases/collections, making cached names stale.
+_MUTATING_COMMANDS = {"cp", "rm", "prune", "restore", "run"}
+
+_ZSH_COMPLETION = r"""#compdef bongo
+# bongo zsh completion — load with: source <(bongo completion zsh)
+_bongo() {
+  local line ret=1 files=0
+  local -a described clusters plain
+  for line in "${(@f)$(bongo __complete "${(@)words[2,CURRENT]}" 2>/dev/null)}"; do
+    case $line in
+      '') ;;
+      :files) files=1 ;;
+      *$'\t'*) described+=("${line%%$'\t'*}:${line#*$'\t'}") ;;
+      *:) clusters+=("${line%:}") ;;
+      *) plain+=("$line") ;;
+    esac
+  done
+  (( $#described )) && _describe 'bongo' described && ret=0
+  # The ':' after a cluster is dropped again if the next key is a space or enter.
+  (( $#clusters )) && compadd -qS : -a clusters && ret=0
+  (( $#plain )) && compadd -a plain && ret=0
+  (( files )) && _files && ret=0
+  return ret
+}
+compdef _bongo bongo
+"""
+
+
+def _clear_complete_cache() -> None:
+    try:
+        _COMPLETE_CACHE_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _complete_names(key: str, uri: str, expression: str) -> list[str]:
+    """Evaluate a mongosh expression yielding a list of names, cached briefly so repeated tabs are instant."""
+    try:
+        cache = json.loads(_COMPLETE_CACHE_PATH.read_text())
+    except Exception:
+        cache = {}
+    entry = cache.get(key)
+    now = time.time()
+    if entry and 0 <= now - entry["at"] < (_COMPLETE_TTL_SECONDS if entry["ok"] else _COMPLETE_FAILURE_TTL_SECONDS):
+        return entry["names"]
+    try:
+        names = [n for n in _mongosh_json(uri, expression, timeout=_COMPLETE_TIMEOUT_SECONDS) if isinstance(n, str)]
+        ok = True
+    except (SystemExit, OSError):  # unreachable cluster or no mongosh: remember that briefly too
+        names, ok = [], False
+    cache[key] = {"at": now, "ok": ok, "names": names}
+    try:
+        _COMPLETE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _COMPLETE_CACHE_PATH.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(cache))
+        os.replace(tmp, _COMPLETE_CACHE_PATH)
+    except OSError:
+        pass
+    return names
+
+
+def _complete_databases(config: dict, cluster_name: str) -> list[str]:
+    uri = config["clusters"].get(cluster_name, {}).get("uri")
+    if not uri:
+        return []
+    names = _complete_names(
+        cluster_name, uri, "db.adminCommand({listDatabases: 1, nameOnly: true}).databases.map(d => d.name)",
+    )
+    return sorted(n for n in names if n not in _SYSTEM_DBS)
+
+
+def _complete_snapshots() -> dict[str, list[str]]:
+    """Map each cluster that has snapshots to its snapshotted databases."""
+    found: dict[str, set[str]] = {}
+    for path in _snapshot_files():
+        parts = path.name.removesuffix(".archive.gz").split("__")
+        if len(parts) == 3:
+            found.setdefault(parts[0], set()).add(parts[1])
+    return {cluster_name: sorted(dbs) for cluster_name, dbs in found.items()}
+
+
+def _complete_address(config: dict, word: str, clusters, databases) -> list[str]:
+    """Candidates for a <cluster>:<db> word: 'cluster:' prefixes and the default cluster's dbs, or one cluster's dbs."""
+    if ":" in word:
+        cluster_name = word.split(":", 1)[0]
+        if cluster_name not in clusters:
+            return []
+        return [f"{cluster_name}:{db}" for db in databases(cluster_name)]
+    candidates = [f"{name}:" for name in sorted(clusters)]
+    if config.get("default") in clusters:
+        candidates += databases(config["default"])
+    return candidates
+
+
+def _complete_collections(config: dict, address: str) -> list[str]:
+    if ":" in address:
+        cluster_name, db = address.split(":", 1)
+    else:
+        cluster_name, db = config.get("default", ""), address
+    if db == ".":
+        db = _branch_db(_git_branch() or "")
+    uri = config["clusters"].get(cluster_name, {}).get("uri")
+    if not uri or not _DB_NAME_RE.match(db):
+        return []
+    names = _complete_names(f"{cluster_name}:{db}", uri, f"db.getSiblingDB({json.dumps(db)}).getCollectionNames()")
+    return sorted(n for n in names if not n.startswith("system."))
+
+
+def _complete(words: list[str]) -> list[str]:
+    """Return completion candidates for the words after 'bongo', the last being the one under the cursor.
+
+    A candidate is 'word' or 'word<TAB>description'; a trailing ':' marks a cluster prefix.
+    """
+    _, sub = _build_parser()
+    *before, current = words or [""]
+    if not before:
+        return [f"{action.dest}\t{action.help}" for action in sub._choices_actions]
+    command = sub.choices.get(before[0])
+    if command is None:
+        return []
+
+    options = {flag: action for action in command._actions for flag in action.option_strings}
+    positionals: list[str] = []
+    pending = None  # option still waiting for its value
+    for word in before[1:]:
+        if pending is not None:
+            pending = None
+        elif word == "--":
+            return []  # the rest are script arguments
+        elif word in options:
+            pending = options[word] if options[word].nargs != 0 else None
+        elif not word.startswith("-") or word == "-":
+            positionals.append(word)
+    if pending is not None:
+        return [_COMPLETE_FILES] if pending.dest == "file" else []
+
+    flags = [
+        f"{flag}\t{action.help}" for flag, action in options.items()
+        if not isinstance(action, argparse._HelpAction)
+    ]
+    kinds = _COMPLETE_POSITIONALS.get(before[0], [])
+    if current.startswith("-"):
+        return flags
+    if len(positionals) >= len(kinds):
+        return [] if before[0] == "run" else flags
+
+    try:
+        config = _load_config()
+    except SystemExit:
+        config = {"clusters": {}}
+    kind = kinds[len(positionals)]
+    if kind == "cluster":
+        return sorted(config["clusters"])
+    if kind == "db":
+        return _complete_address(config, current, config["clusters"], lambda name: _complete_databases(config, name))
+    if kind == "snapshot":
+        snapshots = _complete_snapshots()
+        return _complete_address(config, current, snapshots, lambda name: snapshots[name])
+    if kind == "collection":
+        return _complete_collections(config, positionals[0])
+    if kind == "script":
+        return sorted(config.get("scripts", {})) + [_COMPLETE_FILES]
+    return ["zsh"]
+
+
+def _cmd_complete(words: list[str]) -> None:
+    try:
+        candidates = _complete(words)
+    except Exception:
+        return  # completion must never spill a traceback into the prompt
+    print("\n".join(c for c in candidates if "\n" not in c))
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = parse_args(argv)
+    raw_argv = sys.argv[1:] if argv is None else argv
+    if raw_argv[:1] == ["__complete"]:
+        _cmd_complete(raw_argv[1:])
+        return
+    args = parse_args(raw_argv)
+
+    if args.command == "completion":
+        print(_ZSH_COMPLETION, end="")
+        return
 
     if args.command == "init":
         _cmd_init(args)
@@ -1379,6 +1603,8 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     config = _load_config()
+    if args.command in _MUTATING_COMMANDS:
+        atexit.register(_clear_complete_cache)
     if args.command == "ls":
         _require_tools("mongosh")
         _cmd_ls(config, args)

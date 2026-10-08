@@ -202,6 +202,14 @@ adduser = "scripts/adduser.js" # relative to ~/.config/bongo
 
 Databases listed in `protected` cannot be dropped or overwritten without `--force`. Copying onto an existing database prompts before replacing it (`-y` skips the prompt).
 
+Tab completion for zsh covers subcommands, flags, clusters, databases, collections, script labels and snapshots. Add this to `~/.zshrc`, after `compinit` (or after oh-my-zsh is sourced):
+
+```sh
+source <(bongo completion zsh)
+```
+
+Completing a database or collection name connects to the cluster with `mongosh` (three-second timeout); the names are cached for 60 seconds in `~/.cache/bongo/completion.json` and the cache is cleared whenever `cp`, `rm`, `prune`, `restore` or `run` finishes.
+
 ### oneshot
 
 One-shot LLM query from the terminal — get a shell command or a quick explanation without leaving your workflow.

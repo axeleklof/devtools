@@ -332,3 +332,113 @@ def test_ls_cluster_still_lists_databases(
     for argv in (["ls"], ["ls", "local"]):
         bongo._cmd_ls(config, bongo.parse_args(argv))
         assert "main" in capsys.readouterr().out
+
+
+_COMPLETE_CONFIG = {
+    "default": "local",
+    "clusters": {"local": {"uri": "mongodb://localhost:27017"}, "dev": {"uri": "mongodb://dev.test"}},
+    "scripts": {"adduser": "scripts/adduser.js"},
+}
+
+
+@pytest.fixture
+def complete_names(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[str]:
+    """Stub the cluster lookups behind completion; returns the keys that were looked up."""
+    names = {"local": ["admin", "main", "pr-1"], "dev": ["staging"], "dev:staging": ["users", "system.views", "alarms"]}
+    looked_up: list[str] = []
+
+    def lookup(key: str, uri: str, expression: str) -> list[str]:
+        looked_up.append(key)
+        return names.get(key, [])
+
+    monkeypatch.setattr(bongo, "_load_config", lambda: _COMPLETE_CONFIG)
+    monkeypatch.setattr(bongo, "_complete_names", lookup)
+    monkeypatch.setattr(bongo, "_SNAPSHOT_DIR", tmp_path)
+    return looked_up
+
+
+def test_complete_subcommands_and_flags(complete_names: list[str]) -> None:
+    assert "cat\tprint documents from a collection, with simple filters" in bongo._complete(["c"])
+    assert bongo._complete(["nope", ""]) == []
+
+    flags = bongo._complete(["cp", "main", "-"])
+    assert "--force\tallow overwriting a protected database" in flags
+    assert not any(flag.startswith("-h") for flag in flags)
+    assert bongo._complete(["cp", "main", "pr-1", ""]) == flags  # nothing positional left to offer
+    assert complete_names == []
+
+
+def test_complete_databases(complete_names: list[str]) -> None:
+    # No cluster typed yet: cluster prefixes plus the default cluster's databases, minus system ones.
+    assert bongo._complete(["cat", ""]) == ["dev:", "local:", "main", "pr-1"]
+    assert bongo._complete(["cp", "main", "dev:st"]) == ["dev:staging"]
+    assert bongo._complete(["ls", "nope:"]) == []
+    assert bongo._complete(["prune", ""]) == ["dev", "local"]
+
+
+def test_complete_collections_skip_flags_and_their_values(complete_names: list[str]) -> None:
+    assert bongo._complete(["cat", "dev:staging", ""]) == ["alarms", "users"]
+    assert bongo._complete(["cat", "-n", "5", "-r", "dev:staging", "us"]) == ["alarms", "users"]
+    assert bongo._complete(["cat", "dev:staging", "-n", ""]) == []  # the value of -n
+    assert bongo._complete(["cat", "bad name", ""]) == []
+    assert "dev:bad name" not in complete_names
+
+
+def test_complete_collections_of_branch_database(
+    complete_names: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bongo, "_git_branch", lambda: "feature/x")
+
+    bongo._complete(["cat", ".", ""])
+
+    assert complete_names == ["local:feature-x"]
+
+
+def test_complete_scripts_and_snapshots(complete_names: list[str], tmp_path: Path) -> None:
+    for name in ("local__main__20260101-000000", "local__main__20260102-000000", "dev__staging__20260101-000000"):
+        (tmp_path / f"{name}.archive.gz").touch()
+
+    assert bongo._complete(["run", ""]) == ["adduser", ":files"]
+    assert bongo._complete(["run", "adduser", "main", "--", ""]) == []
+    assert bongo._complete(["restore", ""]) == ["dev:", "local:", "main"]
+    assert bongo._complete(["restore", "dev:"]) == ["dev:staging"]
+    assert bongo._complete(["restore", "--file", ""]) == [":files"]
+    assert complete_names == []  # snapshots are local files
+
+
+def test_complete_names_caches_results_and_failures(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def mongosh_json(uri: str, expression: str, timeout: float = 30):
+        calls.append(uri)
+        if uri == "down":
+            raise SystemExit("bongo: mongosh timed out")
+        return ["main", "pr-1"]
+
+    now = [1000.0]
+    monkeypatch.setattr(bongo, "_COMPLETE_CACHE_PATH", tmp_path / "cache" / "completion.json")
+    monkeypatch.setattr(bongo, "_mongosh_json", mongosh_json)
+    monkeypatch.setattr(bongo.time, "time", lambda: now[0])
+
+    assert bongo._complete_names("local", "up", "x") == ["main", "pr-1"]
+    assert bongo._complete_names("dev", "down", "x") == []
+    assert bongo._complete_names("local", "up", "x") == ["main", "pr-1"]
+    assert bongo._complete_names("dev", "down", "x") == []
+    assert calls == ["up", "down"]
+
+    now[0] += bongo._COMPLETE_FAILURE_TTL_SECONDS + 1  # failures are retried sooner
+    bongo._complete_names("local", "up", "x")
+    bongo._complete_names("dev", "down", "x")
+    assert calls == ["up", "down", "down"]
+
+    bongo._clear_complete_cache()
+    bongo._complete_names("local", "up", "x")
+    assert calls == ["up", "down", "down", "up"]
+
+
+def test_complete_command_prints_candidates(complete_names: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    bongo.main(["__complete", "cat", "dev:"])
+    assert capsys.readouterr().out == "dev:staging\n"
+
+    bongo.main(["completion", "zsh"])
+    assert "compdef _bongo bongo" in capsys.readouterr().out
