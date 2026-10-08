@@ -125,6 +125,7 @@ bongo cat main users                  # print documents (first 10; -n all for ev
 bongo cat main users axel role=admin  # ...filtered: 'axel' anywhere, and role equal to admin
 bongo ls                              # list databases on the default cluster (with sizes)
 bongo ls atlas-dev
+bongo ls atlas-dev:main                # list collections in a database (with doc counts)
 bongo rm pr-539                       # drop a database (asks for confirmation)
 bongo prune --days 7                  # offer to drop bongo-created dbs older than a week
 bongo snapshot main                   # gzipped archive in ~/.local/share/bongo/snapshots

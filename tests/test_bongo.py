@@ -301,3 +301,34 @@ def test_cat_highlights_search_matches(monkeypatch: pytest.MonkeyPatch) -> None:
     assert '"email": "max@x.com"' in rendered  # the regex only applies to the top-level email field
     assert '"role": "admin"' in rendered
     assert bongo._render_json({"age": 23}, highlights=bongo._parse_cat_terms(["23"])[2]) == '{\n  "age": <23>\n}'
+
+
+def test_ls_database_lists_collections(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = {
+        "default": "local",
+        "clusters": {"local": {"uri": "mongodb://localhost:27017", "protected": ["main"]}},
+    }
+    stats = {"users": {"count": 1234}, "audit": {"count": 0}}
+    monkeypatch.setattr(bongo, "_collection_stats", lambda uri, db: stats if db == "main" else {})
+
+    for target in ("local:main", "main"):  # a bare name that is not a cluster is a db
+        bongo._cmd_ls(config, bongo.parse_args(["ls", target]))
+        lines = capsys.readouterr().out.splitlines()
+        assert lines[0] == "local:main  [protected]"
+        assert [line.split() for line in lines[1:]] == [["audit", "0", "docs"], ["users", "1,234", "docs"]]
+
+    with pytest.raises(SystemExit, match="'nope' not found"):
+        bongo._cmd_ls(config, bongo.parse_args(["ls", "local:nope"]))
+
+
+def test_ls_cluster_still_lists_databases(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = {"default": "local", "clusters": {"local": {"uri": "mongodb://localhost:27017"}}}
+    monkeypatch.setattr(bongo, "_list_databases", lambda uri: [{"name": "main", "size": 2048}])
+
+    for argv in (["ls"], ["ls", "local"]):
+        bongo._cmd_ls(config, bongo.parse_args(argv))
+        assert "main" in capsys.readouterr().out

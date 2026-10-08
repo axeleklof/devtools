@@ -484,7 +484,12 @@ def _summary(stats: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _cmd_ls(config: dict, args: argparse.Namespace) -> None:
-    cluster_name = args.cluster or config.get("default")
+    target = args.target
+    # Same resolution as `sh`: a bare name is a cluster if one is configured, else a db on the default cluster.
+    if target is not None and (":" in target or target not in config["clusters"]):
+        _ls_collections(config, *_resolve_address(config, target))
+        return
+    cluster_name = target or config.get("default")
     if not cluster_name:
         sys.exit("bongo: no cluster given and no default cluster is set in config")
     cluster = _get_cluster(config, cluster_name)
@@ -500,6 +505,17 @@ def _cmd_ls(config: dict, args: argparse.Namespace) -> None:
         print(f"  {db['name']:<30} {_format_size(db['size']):>10}{tag}")
     if hidden:
         print(_c("2", f"  ({hidden} system databases hidden — use -a to show)"))
+
+
+def _ls_collections(config: dict, cluster_name: str, db: str) -> None:
+    stats = _collection_stats(config["clusters"][cluster_name]["uri"], db)
+    if not stats:
+        sys.exit(f"bongo: database '{db}' not found on cluster '{cluster_name}'")
+    tag = "  [protected]" if _is_protected(config, cluster_name, db) else ""
+    print(f"{cluster_name}:{db}{tag}")
+    width = max(30, *map(len, stats))
+    for name in sorted(stats):
+        print(f"  {name:<{width}} {stats[name]['count']:>12,} docs")
 
 
 _SYSTEM_DBS = {"admin", "config", "local"}
@@ -1284,6 +1300,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  bongo diff main pr-539            # collection/count/index differences\n"
             "  bongo ls                          # databases on the default cluster\n"
             "  bongo ls atlas-dev\n"
+            "  bongo ls atlas-dev:main           # collections in a database, with doc counts\n"
             "  bongo rm pr-539\n"
             "  bongo prune --days 7              # offer to drop bongo-created dbs older than a week\n"
             "  bongo snapshot main               # archive to ~/.local/share/bongo/snapshots\n"
@@ -1306,8 +1323,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     rm.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     rm.add_argument("--force", action="store_true", help="allow dropping a protected database")
 
-    ls = sub.add_parser("ls", help="list databases on a cluster")
-    ls.add_argument("cluster", nargs="?", help="cluster name (defaults to the default cluster)")
+    ls = sub.add_parser("ls", help="list databases on a cluster, or collections in a database")
+    ls.add_argument("target", nargs="?", help="<cluster> for its databases, <cluster>:<db> or <db> for its collections (defaults to the default cluster)")
     ls.add_argument("-a", "--all", action="store_true", help="include system databases (admin, config, local)")
 
     prune = sub.add_parser("prune", help="interactively drop databases created by bongo")
