@@ -51,6 +51,9 @@ def test_copy_png_uses_wayland_clipboard(
     assert adbshot._copy_png_to_clipboard(path) is True
     assert invocation["cmd"] == ["wl-copy", "--type", "image/png"]
     assert invocation["input"] == b"png data"
+    # A pipe here hangs: the forked wl-copy daemon holds it open forever.
+    assert invocation["stdout"] is subprocess.DEVNULL
+    assert invocation["stderr"] is not subprocess.PIPE
 
 
 def test_copy_png_reports_missing_clipboard_tool(

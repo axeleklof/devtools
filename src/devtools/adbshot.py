@@ -51,16 +51,20 @@ def _copy_png_to_clipboard(path: Path) -> bool:
         )
         return False
 
-    result = subprocess.run(
-        cmd,
-        input=input_data,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
-    if result.returncode != 0:
-        detail = result.stderr.decode(errors="replace").strip()
-        print(f"Failed to copy screenshot to clipboard: {detail}", file=sys.stderr)
-        return False
+    # wl-copy and xclip fork a daemon that keeps serving the clipboard and
+    # inherits our stderr. A pipe would never reach EOF, so use a file.
+    with tempfile.TemporaryFile() as stderr:
+        result = subprocess.run(
+            cmd,
+            input=input_data,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr,
+        )
+        if result.returncode != 0:
+            stderr.seek(0)
+            detail = stderr.read().decode(errors="replace").strip()
+            print(f"Failed to copy screenshot to clipboard: {detail}", file=sys.stderr)
+            return False
     return True
 
 
