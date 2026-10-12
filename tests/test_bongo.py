@@ -215,7 +215,7 @@ def test_cat_limits_output_and_warns_on_stderr(
     assert len(captured.out.splitlines()) == 10
     assert captured.out.splitlines()[0] == '{"_id": "000000000000000000000000", "name": "user0"}'
     assert "first 10 documents" in captured.err
-    assert "--limit=11" in command
+    assert ".limit(11)" in command[-1]
 
 
 def test_cat_all_prints_everything_without_warning(
@@ -226,7 +226,7 @@ def test_cat_all_prints_everything_without_warning(
     captured = capsys.readouterr()
     assert len(captured.out.splitlines()) == 25
     assert captured.err == ""
-    assert not any(arg.startswith("--limit") for arg in command)
+    assert ".limit(" not in command[-1]
 
 
 def test_cat_bare_word_filters_client_side(
@@ -235,7 +235,7 @@ def test_cat_bare_word_filters_client_side(
     command = _run_cat(monkeypatch, 25, ["main", "users", "USER2", "-c"])
 
     assert capsys.readouterr().out.strip() == "6"  # user2, user20..user24
-    assert not any(arg.startswith(("--limit", "--fields")) for arg in command)
+    assert ".limit(" not in command[-1] and "{_id: 1}" not in command[-1]
 
 
 def test_cat_explicit_limit_does_not_warn(

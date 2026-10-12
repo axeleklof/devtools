@@ -267,7 +267,6 @@ def _require_tools(*tools: str) -> None:
             "mongosh": "install mongosh: https://www.mongodb.com/docs/mongodb-shell/install/",
             "mongodump": "install MongoDB Database Tools: https://www.mongodb.com/docs/database-tools/installation/",
             "mongorestore": "install MongoDB Database Tools: https://www.mongodb.com/docs/database-tools/installation/",
-            "mongoexport": "install MongoDB Database Tools: https://www.mongodb.com/docs/database-tools/installation/",
         }
         lines = [f"bongo: missing required tools: {', '.join(missing)}"]
         for hint in sorted({hints[t] for t in missing}):
@@ -1124,6 +1123,22 @@ def _render_json(value, depth: int = 0, highlights: list[tuple] = (), path: str 
     return text
 
 
+def _cat_script(
+    db: str, collection: str, query: dict, sort: dict | None = None, limit: int | None = None, id_only: bool = False,
+) -> str:
+    """mongosh script printing each matching document as one line of extended JSON."""
+    # The query goes through EJSON.parse so {"$oid": ...} and {"$date": ...} become real ObjectIds and dates.
+    cursor = (
+        f"db.getSiblingDB({json.dumps(db)}).getCollection({json.dumps(collection)})"
+        f".find(EJSON.parse({json.dumps(json.dumps(query))}){', {_id: 1}' if id_only else ''})"
+    )
+    if sort:
+        cursor += f".sort({json.dumps(sort)})"
+    if limit is not None:
+        cursor += f".limit({limit})"
+    return f"{cursor}.forEach(doc => print(EJSON.stringify(doc)))"
+
+
 def _cmd_cat(config: dict, args: argparse.Namespace) -> None:
     cluster_name, db = _resolve_address(config, args.database)
     uri = config["clusters"][cluster_name]["uri"]
@@ -1140,22 +1155,18 @@ def _cmd_cat(config: dict, args: argparse.Namespace) -> None:
     fields = [f for f in (args.fields or "").split(",") if f]
     excluded = [f.split(".") for f in (args.exclude or "").split(",") if f]
 
-    cmd = [
-        "mongoexport", f"--uri={uri}", f"--db={db}", f"--collection={args.collection}",
-        f"--query={json.dumps(query)}",
-    ]
-    if sort_field:
-        cmd.append(f"--sort={json.dumps({sort_field: -1 if args.reverse else 1})}")
-    if not words:
-        # Bare words are matched client-side, so only without them can the server limit and trim.
-        if limit is not None:
-            cmd.append(f"--limit={limit + 1}")
-        if args.count:
-            cmd.append("--fields=_id")
+    # Bare words are matched client-side, so only without them can the server limit and trim.
+    script = _cat_script(
+        db, args.collection, query,
+        sort={sort_field: -1 if args.reverse else 1} if sort_field else None,
+        limit=limit + 1 if limit is not None and not words else None,
+        id_only=args.count and not words,
+    )
+    cmd = ["mongosh", uri, "--quiet", "--eval", script]
 
     pretty = sys.stdout.isatty()
     shown, more = 0, False
-    # mongoexport logs to stderr; keep it in a file (a pipe could fill up) and show it only on failure.
+    # Keep mongosh's stderr in a file (a pipe could fill up) and show it only on failure.
     log = tempfile.TemporaryFile("w+")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log, text=True)
     try:
@@ -1188,9 +1199,8 @@ def _cmd_cat(config: dict, args: argparse.Namespace) -> None:
     else:
         if proc.wait() != 0:
             log.seek(0)
-            # Last log line, minus its timestamp, is the actual error.
-            detail = (log.read().strip().splitlines() or ["no output"])[-1].split("\t", 1)[-1]
-            sys.exit(f"bongo: mongoexport failed: {detail.replace(uri, _redact_uri(uri))}")
+            detail = (log.read().strip().splitlines() or ["no output"])[-1]
+            sys.exit(f"bongo: mongosh failed: {_redact_uri(detail.replace(uri, _redact_uri(uri)))}")
 
     if args.count:
         print(shown)
@@ -1634,5 +1644,5 @@ def main(argv: list[str] | None = None) -> None:
         _require_tools("mongosh")
         _cmd_diff(config, args)
     elif args.command == "cat":
-        _require_tools("mongosh", "mongoexport")
+        _require_tools("mongosh")
         _cmd_cat(config, args)

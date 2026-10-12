@@ -179,7 +179,7 @@ bongo cat main users -d 1                 # collapse nested values: "tags": […
 bongo cat dev:main users -n all | jq .email
 ```
 
-Values are typed for you: `true`/`false`/`null`, ObjectIds, ISO dates, and numbers (`zip=12345` matches both `12345` and `"12345"`). Flags: `-n N|all` (default 10, with a notice on stderr when more match), `-s FIELD` sort, `-r` descending (by `_id` without `-s`), `-f a,b` fields, `-x a,b` exclude fields, `-d N` collapse anything nested deeper than N levels into a placeholder (a string like `"{… 3 fields}"` when piped), `-c` count, `-q JSON` raw query. Output is pretty-printed and colored on a terminal, and one JSON document per line when piped; ObjectIds and dates are printed as plain strings. Bare words are matched client-side, so on a large remote collection prefer `field~word`. Requires `mongoexport` from the Database Tools.
+Values are typed for you: `true`/`false`/`null`, ObjectIds, ISO dates, and numbers (`zip=12345` matches both `12345` and `"12345"`). Flags: `-n N|all` (default 10, with a notice on stderr when more match), `-s FIELD` sort, `-r` descending (by `_id` without `-s`), `-f a,b` fields, `-x a,b` exclude fields, `-d N` collapse anything nested deeper than N levels into a placeholder (a string like `"{… 3 fields}"` when piped), `-c` count, `-q JSON` raw query. Output is pretty-printed and colored on a terminal, and one JSON document per line when piped; ObjectIds and dates are printed as plain strings. Bare words are matched client-side, so on a large remote collection prefer `field~word`.
 
 Databases are addressed as `<cluster>:<db>`; a bare `<db>` uses the default cluster. Clusters are defined in `~/.config/bongo/config.toml`:
 
