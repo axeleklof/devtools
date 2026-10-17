@@ -1,4 +1,5 @@
 import argparse
+import os
 import subprocess
 from pathlib import Path
 
@@ -443,8 +444,9 @@ def test_edit_args() -> None:
     assert args.command == "edit"
     assert (args.database, args.collection, args.terms) == ("main", "users", ["axel"])
     assert args.verbose is True and args.fields == "settings"
+    assert bongo.parse_args(["edit", "main", "users", "-n", "1"]).limit == 1
     with pytest.raises(SystemExit):
-        bongo.parse_args(["edit", "main", "users", "-n", "3"])
+        bongo.parse_args(["edit", "main", "users", "-d", "1"])
 
 
 _EDIT_DOCS = [
@@ -481,15 +483,17 @@ def _run_edit(
         seen["updates"].append(expression)
         return {"matched": matched, "modified": matched}
 
-    def pick(items: list[str], prompt: str, previews=None):
+    def pick(items: list[str], prompt: str, previews=None, highlights=(), **kwargs):
         seen["picker"] = items
         seen["previews"] = previews
-        return items[picked] if picked is not None else None
+        seen["highlights"] = highlights
+        return picked, ""
 
+    monkeypatch.setenv("NO_COLOR", "1")
     monkeypatch.setattr(bongo.subprocess, "Popen", popen)
     monkeypatch.setattr(bongo, "_run_editor", editor)
     monkeypatch.setattr(bongo, "_mongosh_json", mongosh_json)
-    monkeypatch.setattr(bongo, "_pick", pick)
+    monkeypatch.setattr(bongo, "_pick_with_key", pick)
     monkeypatch.setattr("builtins.input", lambda prompt: answers.pop(0))
     monkeypatch.setattr(bongo, "_EDIT_LOG_PATH", tmp_path / "edits.jsonl")
     config = {"default": "local", "clusters": {"local": {"uri": "mongodb://localhost:27017", "protected": ["main"]}}}
@@ -534,8 +538,7 @@ def test_edit_picks_among_matches_and_reopens_on_errors(
     )
 
     assert seen["picker"][1] == '000000000000000000000001  {"name": "Bob", "role": "user"}'
-    assert bongo.json.loads(seen["previews"][1]) == bob  # pretty-printed as it opens in the editor
-    assert len(seen["previews"][1].splitlines()) == 7  # multi-line, not one compact line
+    assert seen["previews"][1] == bob  # previewed as it opens in the editor
     assert ".limit(201)" in seen["commands"][0][-1]
     # The buffer opens with the document, and each reopen keeps what was typed so far.
     assert [bongo.json.loads(seen["buffers"][0])] == [bob]
@@ -548,21 +551,135 @@ def test_edit_picks_among_matches_and_reopens_on_errors(
 
 def test_pick_with_previews_shows_them_in_an_fzf_pane(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: dict = {}
+    real_run = subprocess.run
 
     def run(cmd, input, **kwargs):
         seen["cmd"], seen["input"] = cmd, input
-        workdir = cmd[cmd.index("--preview") + 1].split()[1].rsplit("/", 1)[0]
-        seen["preview_1"] = Path(workdir, "1").read_text()
+        # Run the preview command the way fzf would, for item 1 with "Bob x" typed into the query.
+        preview = cmd[cmd.index("--preview") + 1].replace("{1}", "1").replace("{q}", "'Bob x'")
+        env = {k: v for k, v in os.environ.items() if k != "NO_COLOR"}
+        seen["preview"] = real_run(preview, shell=True, capture_output=True, text=True, env=env)
         return subprocess.CompletedProcess(cmd, 0, "1\tsecond item\n", "")
 
     monkeypatch.setattr(bongo.shutil, "which", lambda tool: "/usr/bin/fzf")
     monkeypatch.setattr(bongo.subprocess, "run", run)
+    _, _, highlights = bongo._parse_cat_terms(["role~adm"])
 
-    assert bongo._pick(["first item", "second item"], "pick:", ["one\n1", "two\n2"]) == "second item"
-    assert seen["input"] == "0\tfirst item\n1\tsecond item"
-    assert seen["preview_1"] == "two\n2"
+    # Identical items are told apart by the hidden index.
+    docs = [{"name": "Al"}, {"name": "Bob", "role": "admin", "tags": ["x", "y"]}]
+    assert bongo._pick_with_key(["same", "same"], "pick:", docs, highlights=highlights, depth=1) == (1, "")
+    assert seen["input"] == "0\tsame\n1\tsame"
     assert seen["cmd"][seen["cmd"].index("--with-nth") + 1] == "2.."
     assert seen["cmd"][seen["cmd"].index("--preview-window") + 1].startswith("right:")
+    assert seen["preview"].returncode == 0, seen["preview"].stderr
+    out = seen["preview"].stdout
+    mark = lambda text: f"\x1b[30;43m{text}\x1b[0m"
+    assert mark("Bob") in out  # typed into fzf: "Bob" is case-sensitive (smart case)
+    assert mark("adm") in out  # the cat term, still scoped to the role field
+    assert "[… 2 items]" in out  # collapsed to the depth, with "x" inside hidden
+
+    monkeypatch.setattr(bongo.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "1\tb\n", ""))
+    assert bongo._pick(["a", "b"], "pick:") == "b"
+    monkeypatch.setattr(bongo.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 130, "", ""))
+    assert bongo._pick(["a", "b"], "pick:") is None  # Esc
+
+    # With --expect, the pressed key comes first: empty for enter.
+    for out, expected in [
+        ("ctrl-e\n1\tb\n", (1, "ctrl-e")),
+        ("\n0\ta\n", (0, "")),
+        ("1\tb\n", (1, "")),  # --filter mode prints no key line
+        ("", (None, "")),
+    ]:
+        monkeypatch.setattr(bongo.subprocess, "run", lambda cmd, out=out, **kw: subprocess.CompletedProcess(cmd, 0, out, ""))
+        assert bongo._pick_with_key(["a", "b"], "pick:", expect=["ctrl-e"]) == expected
+
+
+def test_cat_interactive_picks_one_document(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen: dict = {}
+
+    def pick(items, prompt, previews=None, expect=(), header=None, highlights=(), depth=None):
+        seen.update(items=items, prompt=prompt, previews=previews, expect=expect, highlights=highlights)
+        return 2, ""
+
+    monkeypatch.setattr(bongo.shutil, "which", lambda tool: "/usr/bin/fzf")
+    monkeypatch.setattr(bongo, "_pick_with_key", pick)
+    command = _run_cat(monkeypatch, 250, ["main", "users", "-i", "-x", "_id", "name~user"])
+
+    assert ".limit(201)" in command[-1]
+    assert seen["prompt"] == "cat (first 200):"
+    assert seen["items"][:2] == ['{"name": "user0"}', '{"name": "user1"}']
+    assert seen["previews"][2] == {"name": "user2"}
+    assert [(field, p.pattern) for field, p in seen["highlights"]] == [("name", "user")]
+
+    # The whole document stays in the line fzf searches, however far in a value sits.
+    long_doc = {"_id": "1", "token": "x" * 300, "firstName": "AXEL"}
+    assert bongo._doc_summary(long_doc).endswith('"firstName": "AXEL"}')
+    captured = capsys.readouterr()
+    assert captured.out == '{"name": "user2"}\n'
+    assert captured.err == ""
+
+    assert seen["expect"] == ["ctrl-e"]
+
+    with pytest.raises(SystemExit, match="cannot be combined"):
+        _run_cat(monkeypatch, 1, ["main", "users", "-i", "-c"])
+    monkeypatch.setattr(bongo.shutil, "which", lambda tool: None)
+    with pytest.raises(SystemExit, match="needs fzf"):
+        _run_cat(monkeypatch, 1, ["main", "users", "-i"])
+
+
+def test_query_highlights_follow_fzf_syntax() -> None:
+    highlights = bongo._query_highlights("axel 'exact ^pre suf$ !not | Smart")
+
+    assert [(p.pattern, bool(p.flags & bongo.re.IGNORECASE)) for _, p in highlights] == [
+        ("axel", True), ("exact", True), ("pre", True), ("suf", True), ("Smart", False),
+    ]
+    assert bongo._query_highlights("") == [] and bongo._query_highlights("a.b")[0][1].pattern == "a\\.b"
+
+
+def test_cat_e_hands_the_command_to_edit(monkeypatch: pytest.MonkeyPatch) -> None:
+    edited: list = []
+    monkeypatch.setattr(bongo, "_cmd_edit", lambda config, args: edited.append(args))
+    config = {"default": "local", "clusters": {"local": {"uri": "mongodb://localhost:27017"}}}
+
+    bongo._cmd_cat(config, bongo.parse_args(["cat", "main", "users", "axel", "-r", "-n", "1", "-f", "name", "-e"]))
+
+    args, = edited
+    assert (args.database, args.collection, args.terms) == ("main", "users", ["axel"])
+    assert (args.reverse, args.limit, args.fields, args.verbose) == (True, 1, "name", False)
+    for flag in (["-c"], ["-i"], ["-d", "1"]):
+        with pytest.raises(SystemExit, match="-e cannot be combined with " + flag[0]):
+            bongo._cmd_cat(config, bongo.parse_args(["cat", "main", "users", "-e", *flag]))
+
+
+def test_edit_n_1_opens_the_first_match_without_a_picker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen = _run_edit(monkeypatch, tmp_path, ["main", "users", "-n", "1"], edits=[_EDIT_DOCS[0]], answers=[])
+
+    assert "picker" not in seen
+    assert ".limit(2)" in seen["commands"][0][-1]
+    assert [bongo.json.loads(b) for b in seen["buffers"]] == [_EDIT_DOCS[0]]
+    assert capsys.readouterr().err == ""  # an explicit -n gets no "more match" notice
+
+
+def test_cat_interactive_ctrl_e_edits_the_picked_document(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    edited: list = []
+    monkeypatch.setattr(bongo.shutil, "which", lambda tool: "/usr/bin/fzf")
+    monkeypatch.setattr(bongo, "_pick_with_key", lambda *a, **kw: (1, "ctrl-e"))
+    monkeypatch.setattr(bongo, "_cmd_edit", lambda config, args: edited.append(args))
+    monkeypatch.setattr(bongo.sys.stdout, "isatty", lambda: True)  # don't reroute pytest's stdout to /dev/tty
+
+    _run_cat(monkeypatch, 3, ["main", "users", "-i", "-x", "_id,role", "-f", "name"])
+
+    args, = edited
+    assert (args.command, args.database, args.collection) == ("edit", "main", "users")
+    assert bongo.json.loads(args.query) == {"_id": {"$oid": f"{1:024x}"}}  # the real _id, though -x hid it
+    assert (args.fields, args.exclude, args.terms) == ("name", "_id,role", [])
+    assert capsys.readouterr().out == ""
 
 
 def test_edit_without_changes_or_with_editor_failure_writes_nothing(

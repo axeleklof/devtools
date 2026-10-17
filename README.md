@@ -177,16 +177,19 @@ bongo cat main users address.city=Stockholm -f name,email
 bongo cat main users -r -n 1              # newest document
 bongo cat main users -x loginHistory,address.zip   # everything but these fields
 bongo cat main users -d 1                 # collapse nested values: "tags": [… 2 items]
+bongo cat main users role=admin -i        # browse matches in fzf with a preview pane; enter prints, ctrl-e edits
+bongo cat main users -r -n 1 -e           # tack on -e to edit what the same command printed
 bongo cat dev:main users -n all | jq .email
 ```
 
-Values are typed for you: `true`/`false`/`null`, ObjectIds, ISO dates, and numbers (`zip=12345` matches both `12345` and `"12345"`). Flags: `-n N|all` (default 10, with a notice on stderr when more match), `-s FIELD` sort, `-r` descending (by `_id` without `-s`), `-f a,b` fields, `-x a,b` exclude fields, `-d N` collapse anything nested deeper than N levels into a placeholder (a string like `"{… 3 fields}"` when piped), `-c` count, `-q JSON` raw query. Output is pretty-printed and colored on a terminal, and one JSON document per line when piped; ObjectIds and dates are printed as plain strings. Bare words are matched client-side, so on a large remote collection prefer `field~word`.
+Values are typed for you: `true`/`false`/`null`, ObjectIds, ISO dates, and numbers (`zip=12345` matches both `12345` and `"12345"`). Flags: `-n N|all` (default 10, with a notice on stderr when more match), `-s FIELD` sort, `-r` descending (by `_id` without `-s`), `-f a,b` fields, `-x a,b` exclude fields, `-d N` collapse anything nested deeper than N levels into a placeholder (a string like `"{… 3 fields}"` when piped), `-c` count, `-q JSON` raw query, `-i` interactive (needs fzf; up to 200 documents unless `-n` says otherwise, both the cat terms and the words typed into fzf highlighted in the preview, and the picked document goes to stdout, so `bongo cat -i main users | jq .email` works; `ctrl-e` instead opens it in `bongo edit` with the same `-f`/`-x`), `-e` edit instead of print (the same as running `bongo edit` with these arguments). Output is pretty-printed and colored on a terminal, and one JSON document per line when piped; ObjectIds and dates are printed as plain strings. Bare words are matched client-side, so on a large remote collection prefer `field~word`.
 
 `bongo edit DATABASE COLLECTION [TERM...]` opens one document in `$VISUAL`/`$EDITOR` (else `nano`, else `vi`). When you save and quit, it shows which fields changed and asks before writing anything:
 
 ```bash
 bongo edit main users axel@example.com    # same terms and -q/-s/-r as cat; several matches open a picker with a preview
 bongo edit main users axel -f settings    # edit only some fields (-x hides fields instead)
+bongo edit main users -r -n 1             # the newest document, straight into the editor (-n caps the picker)
 bongo edit dev:main orders status=stuck -r -v   # -v also prints the updateOne it will run
 ```
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import copy
 import json
 import math
@@ -398,44 +399,103 @@ def _confirm(prompt: str) -> bool:
         return False
 
 
-def _pick(items: list[str], prompt: str, previews: list[str] | None = None) -> str | None:
-    """Let the user pick one item — via fzf when available, else a numbered list.
+def _pick_index(items: list[str], prompt: str, previews: list | None = None) -> int | None:
+    """Let the user pick one item — via fzf when available, else a numbered list — and return its index.
 
-    With `previews` (one text per item), fzf shows the highlighted item's text in a pane on the right.
+    With `previews` (one document per item), fzf shows the highlighted item's document in a pane on the right.
+    """
+    return _pick_with_key(items, prompt, previews)[0]
+
+
+def _pick_with_key(
+    items: list[str],
+    prompt: str,
+    previews: list | None = None,
+    expect: list[str] = (),
+    header: str | None = None,
+    highlights: list[tuple] = (),
+    depth: int | None = None,
+) -> tuple[int | None, str]:
+    """Like _pick_index, also returning which of the `expect` keys (fzf names, e.g. 'ctrl-e') picked the item.
+
+    The key is '' for enter, and always '' without fzf. Previews are rendered by `bongo __preview` on every
+    keystroke, highlighting `highlights` plus the words typed into fzf, and collapsed to `depth` if given.
     """
     if not items:
-        return None
-    if shutil.which("fzf") and previews is not None:
-        with tempfile.TemporaryDirectory(prefix="bongo-pick-") as workdir:
-            for i, text in enumerate(previews):
-                Path(workdir, str(i)).write_text(text)
-            proc = subprocess.run(
-                [
-                    "fzf", "--prompt", f"{prompt} ", "--height", "90%", "--reverse", "--ansi",
-                    "--delimiter", "\t", "--with-nth", "2..",
-                    "--preview", f"cat {shlex.quote(workdir)}/{{1}}", "--preview-window", "right:60%:wrap",
-                ],
-                input="\n".join(f"{i}\t{item}" for i, item in enumerate(items)), stdout=subprocess.PIPE, text=True,
-            )
-        index = proc.stdout.strip().split("\t", 1)[0]
-        return items[int(index)] if index.isdigit() and int(index) < len(items) else None
+        return None, ""
     if shutil.which("fzf"):
-        proc = subprocess.run(
-            ["fzf", "--prompt", f"{prompt} ", "--height", "40%", "--reverse"],
-            input="\n".join(items), stdout=subprocess.PIPE, text=True,
-        )
-        choice = proc.stdout.strip()
-        return choice or None
+        # Each line carries its index (hidden by --with-nth), so identical items stay distinguishable.
+        cmd = ["fzf", "--prompt", f"{prompt} ", "--reverse", "--ansi", "--delimiter", "\t", "--with-nth", "2.."]
+        if expect:
+            cmd += ["--expect", ",".join(expect)]
+        if header:
+            cmd += ["--header", header]
+        with tempfile.TemporaryDirectory(prefix="bongo-pick-") as workdir:
+            if previews is None:
+                cmd += ["--height", "40%"]
+            else:
+                for i, doc in enumerate(previews):
+                    Path(workdir, f"{i}.json").write_text(json.dumps(doc, ensure_ascii=False))
+                spec = {"depth": depth, "highlights": [[field, p.pattern, p.flags] for field, p in highlights]}
+                Path(workdir, "spec.json").write_text(json.dumps(spec))
+                preview = f"{shlex.quote(sys.executable)} -m devtools.bongo __preview {shlex.quote(workdir)} {{1}} {{q}}"
+                cmd += ["--height", "90%", "--preview", preview, "--preview-window", "right:60%:wrap"]
+            proc = subprocess.run(
+                cmd, input="\n".join(f"{i}\t{item}" for i, item in enumerate(items)), stdout=subprocess.PIPE, text=True,
+            )
+        # With --expect, fzf prints the key that was pressed (empty for enter) on a line of its own first —
+        # except in --filter mode. Item lines always hold a tab, key names never do.
+        lines = proc.stdout.rstrip("\n").split("\n")
+        key = lines.pop(0) if expect and lines and "\t" not in lines[0] else ""
+        index = lines[0].split("\t", 1)[0] if lines else ""
+        return (int(index) if index.isdigit() and int(index) < len(items) else None), key
     for i, item in enumerate(items, 1):
         print(f"{i:3}) {item}")
     try:
         raw = input(f"{prompt} [1-{len(items)}] ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
-        return None
+        return None, ""
     if raw.isdigit() and 1 <= int(raw) <= len(items):
-        return items[int(raw) - 1]
-    return None
+        return int(raw) - 1, ""
+    return None, ""
+
+
+def _pick(items: list[str], prompt: str) -> str | None:
+    index = _pick_index(items, prompt)
+    return None if index is None else items[index]
+
+
+def _query_highlights(query: str) -> list[tuple]:
+    """Highlights for the words typed into fzf, as literal text (scattered fuzzy matches are not marked).
+
+    Follows fzf's search syntax: 'exact ^prefix suffix$ terms are marked, !negated ones and | are not,
+    and a word with an uppercase letter is case-sensitive (smart case).
+    """
+    highlights = []
+    for term in query.split():
+        if term == "|" or term.startswith("!"):
+            continue
+        term = term.lstrip("'^").rstrip("$'")
+        if term:
+            flags = 0 if any(c.isupper() for c in term) else re.IGNORECASE
+            highlights.append((None, re.compile(re.escape(term), flags)))
+    return highlights
+
+
+def _cmd_preview(argv: list[str]) -> None:
+    """Print one picker preview: `__preview WORKDIR INDEX [QUERY]`, run by fzf as the selection or query changes."""
+    workdir, index, query = (argv + ["", "", ""])[:3]
+    try:
+        spec = json.loads(Path(workdir, "spec.json").read_text())
+        doc = json.loads(Path(workdir, f"{int(index)}.json").read_text())
+    except (OSError, ValueError):
+        return
+    if spec["depth"]:
+        doc = _collapse(doc, spec["depth"])
+    highlights = [(field, re.compile(pattern, flags)) for field, pattern, flags in spec["highlights"]]
+    with _forced_color():
+        print(_render_json(doc, highlights=highlights + _query_highlights(query)))
 
 
 def _uri_with_db(uri: str, db: str) -> str:
@@ -458,10 +518,24 @@ _TOOL_DONE_RE = re.compile(
 _TOOL_PROGRESS_RE = re.compile(r"\[[#.]*\]\s+(\S+)\s+\d+/\d+\s+\(([\d.]+)%\)")
 
 
+_color_forced = False
+
+
 def _c(code: str, text: str) -> str:
-    if sys.stdout.isatty() and not os.environ.get("NO_COLOR"):
+    if (_color_forced or sys.stdout.isatty()) and not os.environ.get("NO_COLOR"):
         return f"\x1b[{code}m{text}\x1b[0m"
     return text
+
+
+@contextlib.contextmanager
+def _forced_color():
+    """Color output even when stdout is piped — for text shown on the terminal by fzf."""
+    global _color_forced
+    previous, _color_forced = _color_forced, True
+    try:
+        yield
+    finally:
+        _color_forced = previous
 
 
 def _collection_of(namespace: str) -> str:
@@ -967,6 +1041,7 @@ def _cmd_init(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 _CAT_DEFAULT_LIMIT = 10
+_PICK_LIMIT = 200  # documents offered in a picker (cat -i, edit)
 _CAT_TERM_RE = re.compile(r"^([A-Za-z_$][\w.$-]*)(!=|>=|<=|=|~|>|<)(.*)$", re.DOTALL)
 _CAT_RANGE_OPS = {">": "$gt", ">=": "$gte", "<": "$lt", "<=": "$lte"}
 _OBJECT_ID_RE = re.compile(r"^[0-9a-fA-F]{24}$")
@@ -1204,12 +1279,38 @@ def _require_collection(uri: str, cluster_name: str, db: str, collection: str) -
         )
 
 
+def _doc_summary(doc: dict) -> str:
+    """One line for a picker: the _id, then the rest of the document as compact JSON.
+
+    Never truncated — fzf only searches the line, and it scrolls a long line to show where it matched.
+    """
+    plain = _plain(doc)
+    rest = json.dumps({k: v for k, v in plain.items() if k != "_id"}, ensure_ascii=False)
+    if "_id" not in plain:
+        return rest
+    doc_id = plain["_id"] if isinstance(plain["_id"], str) else json.dumps(plain["_id"], ensure_ascii=False)
+    return f"{doc_id}  {rest}"
+
+
 def _cmd_cat(config: dict, args: argparse.Namespace) -> None:
+    if args.edit:
+        # `bongo cat ... -e` is `bongo edit ...`: same terms, -q/-s/-r/-f/-x and -n.
+        clashing = [flag for flag, on in (("-c", args.count), ("-i", args.interactive), ("-d", args.depth)) if on]
+        if clashing:
+            sys.exit(f"bongo: -e cannot be combined with {', '.join(clashing)}")
+        args.verbose = False
+        _cmd_edit(config, args)
+        return
     cluster_name, db = _resolve_address(config, args.database)
     uri = config["clusters"][cluster_name]["uri"]
 
+    if args.interactive and args.count:
+        sys.exit("bongo: -i and -c cannot be combined")
+    if args.interactive and not shutil.which("fzf"):
+        sys.exit("bongo: -i needs fzf: https://github.com/junegunn/fzf#installation")
     query, words, highlights = _query_from_args(args)
-    limit = None if args.count or args.limit == "all" else args.limit or _CAT_DEFAULT_LIMIT
+    default_limit = _PICK_LIMIT if args.interactive else _CAT_DEFAULT_LIMIT
+    limit = None if args.count or args.limit == "all" else args.limit or default_limit
     fields, excluded = _field_args(args)
 
     # Bare words are matched client-side, so only without them can the server limit and trim.
@@ -1223,12 +1324,14 @@ def _cmd_cat(config: dict, args: argparse.Namespace) -> None:
 
     pretty = sys.stdout.isatty()
     shown, more = 0, False
+    picked: list[tuple] = []  # with -i, (_id as extended JSON, document) are collected for the picker instead
     # Keep mongosh's stderr in a file (a pipe could fill up) and show it only on failure.
     log = tempfile.TemporaryFile("w+")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log, text=True)
     try:
         for line in proc.stdout:
-            doc = _plain(json.loads(line))
+            raw = json.loads(line)
+            doc = _plain(raw)
             if words and not _matches_words(doc, words):
                 continue
             if shown == limit:
@@ -1241,6 +1344,9 @@ def _cmd_cat(config: dict, args: argparse.Namespace) -> None:
                 doc = _project(doc, fields)
             for path in excluded:
                 _exclude(doc, path)
+            if args.interactive:
+                picked.append((raw.get("_id"), doc))  # uncollapsed, so -d hides nothing from fzf's search
+                continue
             if args.depth:
                 doc = _collapse(doc, args.depth)
             print(_render_json(doc, highlights=highlights) if pretty else json.dumps(doc, ensure_ascii=False))
@@ -1256,7 +1362,21 @@ def _cmd_cat(config: dict, args: argparse.Namespace) -> None:
     elif proc.wait() != 0:
         _mongosh_failed(uri, log)
 
-    if args.count:
+    if picked:
+        docs = [doc for _, doc in picked]
+        count = f"first {len(docs)}" if more else str(len(docs))
+        index, key = _pick_with_key(
+            [_doc_summary(doc) for doc in docs], f"cat ({count}):", docs,
+            expect=["ctrl-e"], header="enter: print · ctrl-e: edit", highlights=highlights, depth=args.depth,
+        )
+        if index is None:
+            return
+        if key == "ctrl-e":
+            _edit_picked(config, args, picked[index][0])
+        else:
+            doc = _collapse(docs[index], args.depth) if args.depth else docs[index]
+            print(_render_json(doc, highlights=highlights) if pretty else json.dumps(doc, ensure_ascii=False))
+    elif args.count:
         print(shown)
     elif more and args.limit is None:
         # Only for the implicit limit, and on stderr so the notice never ends up in a pipe.
@@ -1266,11 +1386,29 @@ def _cmd_cat(config: dict, args: argparse.Namespace) -> None:
         print("bongo: no documents match", file=sys.stderr)
 
 
+def _edit_picked(config: dict, args: argparse.Namespace, doc_id) -> None:
+    """Hand a document picked in `cat -i` to `edit`, by _id and with the same -f/-x."""
+    if doc_id is None:
+        sys.exit("bongo: this document has no _id, so it cannot be edited")
+    argv = [args.database, args.collection, "-q", json.dumps({"_id": doc_id})]
+    if args.fields:
+        argv += ["-f", args.fields]
+    if args.exclude:
+        argv += ["-x", args.exclude]
+    if not sys.stdout.isatty():
+        # `cat -i | jq ...`: the editor and the review prompts belong on the terminal, not in the pipe.
+        sys.stdout.flush()
+        try:
+            os.dup2(os.open("/dev/tty", os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            sys.exit("bongo: editing needs a terminal")
+    _cmd_edit(config, _parse_edit_args(argv))
+
+
 # ---------------------------------------------------------------------------
 # edit — open one document in $EDITOR and write back only what changed
 # ---------------------------------------------------------------------------
 
-_EDIT_PICK_LIMIT = 200
 _EDIT_LOG_PATH = Path.home() / ".local" / "share" / "bongo" / "edits.jsonl"
 _MISSING = object()
 
@@ -1319,8 +1457,8 @@ def _exact(value):
     return value
 
 
-def _find_docs(uri: str, script: str, words: list[str], cap: int) -> tuple[list[dict], bool]:
-    """Run an exact find script, keeping up to `cap` documents (made _friendly) that contain every word.
+def _find_docs(uri: str, script: str, words: list[str], cap: int | None) -> tuple[list[dict], bool]:
+    """Run an exact find script, keeping up to `cap` (None: all) documents (made _friendly) that contain every word.
 
     Also returns whether more documents matched.
     """
@@ -1349,16 +1487,13 @@ def _id_label(doc: dict) -> str:
     return doc_id if isinstance(doc_id, str) else json.dumps(doc_id, ensure_ascii=False)
 
 
-def _pick_doc(docs: list[dict], fields: list[str], excluded: list[list[str]]) -> dict | None:
+def _pick_doc(docs: list[dict], fields: list[str], excluded: list[list[str]], highlights: list[tuple]) -> dict | None:
     """Pick a document from a list of one-line summaries, previewing each as it will open in the editor."""
-    items = []
-    for doc in docs:  # each item starts with the unique _id, so items.index finds the right document
-        rest = json.dumps({k: v for k, v in _plain(doc).items() if k != "_id"}, ensure_ascii=False)
-        summary = rest if len(rest) <= 120 else rest[:119] + "…"
-        items.append(f"{_id_label(doc)}  {summary}".rstrip())
-    previews = [_render_json(_edit_view(doc, fields, excluded)) for doc in docs]
-    picked = _pick(items, f"edit ({len(docs)} match):", previews)
-    return docs[items.index(picked)] if picked else None
+    previews = [_edit_view(doc, fields, excluded) for doc in docs]
+    index, _ = _pick_with_key(
+        [_doc_summary(doc) for doc in docs], f"edit ({len(docs)} match):", previews, highlights=highlights,
+    )
+    return None if index is None else docs[index]
 
 
 def _edit_view(doc: dict, fields: list[str], excluded: list[list[str]]) -> dict:
@@ -1545,19 +1680,20 @@ def _cmd_edit(config: dict, args: argparse.Namespace) -> None:
     uri = config["clusters"][cluster_name]["uri"]
     target = f"{cluster_name}:{db}"
 
-    query, words, _ = _query_from_args(args)
+    query, words, highlights = _query_from_args(args)
     fields, excluded = _field_args(args)
+    cap = None if args.limit == "all" else args.limit or _PICK_LIMIT
     script = _cat_script(
         db, args.collection, query, sort=_sort_from_args(args),
-        limit=None if words else _EDIT_PICK_LIMIT + 1, exact=True,
+        limit=None if words or cap is None else cap + 1, exact=True,
     )
-    docs, more = _find_docs(uri, script, words, _EDIT_PICK_LIMIT)
+    docs, more = _find_docs(uri, script, words, cap)
     if not docs:
         _require_collection(uri, cluster_name, db, args.collection)
         sys.exit("bongo: no documents match")
-    if more:
-        print(f"bongo: more than {_EDIT_PICK_LIMIT} documents match — showing the first {_EDIT_PICK_LIMIT}", file=sys.stderr)
-    doc = docs[0] if len(docs) == 1 else _pick_doc(docs, fields, excluded)
+    if more and args.limit is None:
+        print(f"bongo: more than {cap} documents match — showing the first {cap} (-n all for every one)", file=sys.stderr)
+    doc = docs[0] if len(docs) == 1 else _pick_doc(docs, fields, excluded, highlights)
     if doc is None:
         sys.exit("bongo: aborted")
 
@@ -1653,10 +1789,17 @@ def _add_cat_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-d", "--depth", type=_cat_depth, metavar="N",
                         help="collapse objects and arrays nested deeper than N levels (1 = top-level fields only)")
     parser.add_argument("-c", "--count", action="store_true", help="print the number of matching documents instead")
+    parser.add_argument("-e", "--edit", action="store_true",
+                        help="edit the matching document instead (same as 'bongo edit' with these arguments)")
+    parser.add_argument("-i", "--interactive", action="store_true",
+                        help=f"browse matches in fzf with a preview; enter prints the one picked, ctrl-e edits it"
+                             f" (default -n {_PICK_LIMIT})")
 
 
 def _add_edit_arguments(parser: argparse.ArgumentParser) -> None:
     _add_query_arguments(parser, "edit")
+    parser.add_argument("-n", dest="limit", type=_cat_limit, metavar="N",
+                        help=f"pick among at most N matches, or 'all' (default: {_PICK_LIMIT}); -n 1 opens the first directly")
     parser.add_argument("-v", "--verbose", action="store_true", help="also print the updateOne command that will run")
 
 
@@ -1675,6 +1818,8 @@ def _parse_cat_args(argv: list[str]) -> argparse.Namespace:
             "  bongo cat main users -r -n 1           # newest document\n"
             "  bongo cat main users -x loginHistory   # everything but a noisy field\n"
             "  bongo cat main users -d 1              # nested objects/arrays collapsed\n"
+            "  bongo cat main users role=admin -i     # browse matches in fzf: enter prints, ctrl-e edits\n"
+            "  bongo cat main users -r -n 1 -e        # tack on -e to edit what you just printed\n"
             "  bongo cat dev:main users -n all | jq .email\n"
         ),
     )
@@ -1699,6 +1844,7 @@ def _parse_edit_args(argv: list[str]) -> argparse.Namespace:
             "  bongo edit main users axel@example.com\n"
             "  bongo edit main users 65f1c0ffee65f1c0ffee65f1\n"
             "  bongo edit main users axel -f settings   # edit only the settings field\n"
+            "  bongo edit main users -r -n 1            # the newest document, no picker\n"
             "  bongo edit dev:main orders status=stuck -r -v\n"
             f"\nEvery applied edit is logged, with the original document, to {_EDIT_LOG_PATH}\n"
         ),
@@ -2038,6 +2184,9 @@ def main(argv: list[str] | None = None) -> None:
     if raw_argv[:1] == ["__complete"]:
         _cmd_complete(raw_argv[1:])
         return
+    if raw_argv[:1] == ["__preview"]:
+        _cmd_preview(raw_argv[1:])
+        return
     args = parse_args(raw_argv)
 
     if args.command == "completion":
@@ -2089,3 +2238,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "edit":
         _require_tools("mongosh")
         _cmd_edit(config, args)
+
+
+if __name__ == "__main__":
+    main()
