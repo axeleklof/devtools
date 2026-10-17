@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import copy
 import json
+import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -14,7 +17,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -395,10 +398,27 @@ def _confirm(prompt: str) -> bool:
         return False
 
 
-def _pick(items: list[str], prompt: str) -> str | None:
-    """Let the user pick one item — via fzf when available, else a numbered list."""
+def _pick(items: list[str], prompt: str, previews: list[str] | None = None) -> str | None:
+    """Let the user pick one item — via fzf when available, else a numbered list.
+
+    With `previews` (one text per item), fzf shows the highlighted item's text in a pane on the right.
+    """
     if not items:
         return None
+    if shutil.which("fzf") and previews is not None:
+        with tempfile.TemporaryDirectory(prefix="bongo-pick-") as workdir:
+            for i, text in enumerate(previews):
+                Path(workdir, str(i)).write_text(text)
+            proc = subprocess.run(
+                [
+                    "fzf", "--prompt", f"{prompt} ", "--height", "90%", "--reverse", "--ansi",
+                    "--delimiter", "\t", "--with-nth", "2..",
+                    "--preview", f"cat {shlex.quote(workdir)}/{{1}}", "--preview-window", "right:60%:wrap",
+                ],
+                input="\n".join(f"{i}\t{item}" for i, item in enumerate(items)), stdout=subprocess.PIPE, text=True,
+            )
+        index = proc.stdout.strip().split("\t", 1)[0]
+        return items[int(index)] if index.isdigit() and int(index) < len(items) else None
     if shutil.which("fzf"):
         proc = subprocess.run(
             ["fzf", "--prompt", f"{prompt} ", "--height", "40%", "--reverse"],
@@ -1124,25 +1144,29 @@ def _render_json(value, depth: int = 0, highlights: list[tuple] = (), path: str 
 
 
 def _cat_script(
-    db: str, collection: str, query: dict, sort: dict | None = None, limit: int | None = None, id_only: bool = False,
+    db: str, collection: str, query: dict, sort: dict | None = None, limit: int | None = None,
+    id_only: bool = False, exact: bool = False,
 ) -> str:
-    """mongosh script printing each matching document as one line of extended JSON."""
+    """mongosh script printing each matching document as one line of extended JSON.
+
+    `exact` prints canonical extended JSON with every number's BSON type intact (int, double, long).
+    """
     # The query goes through EJSON.parse so {"$oid": ...} and {"$date": ...} become real ObjectIds and dates.
+    projection = "{_id: 1}" if id_only else "undefined"
+    options = ", {promoteValues: false}" if exact else ""
     cursor = (
         f"db.getSiblingDB({json.dumps(db)}).getCollection({json.dumps(collection)})"
-        f".find(EJSON.parse({json.dumps(json.dumps(query))}){', {_id: 1}' if id_only else ''})"
+        f".find(EJSON.parse({json.dumps(json.dumps(query))}), {projection}{options})"
     )
     if sort:
         cursor += f".sort({json.dumps(sort)})"
     if limit is not None:
         cursor += f".limit({limit})"
-    return f"{cursor}.forEach(doc => print(EJSON.stringify(doc)))"
+    return f"{cursor}.forEach(doc => print(EJSON.stringify(doc{', {relaxed: false}' if exact else ''})))"
 
 
-def _cmd_cat(config: dict, args: argparse.Namespace) -> None:
-    cluster_name, db = _resolve_address(config, args.database)
-    uri = config["clusters"][cluster_name]["uri"]
-
+def _query_from_args(args: argparse.Namespace) -> tuple[dict, list[str], list[tuple]]:
+    """The server-side query, client-side words and highlights for cat/edit's terms and -q."""
     conditions, words, highlights = _parse_cat_terms(args.terms)
     if args.query:
         try:
@@ -1150,15 +1174,48 @@ def _cmd_cat(config: dict, args: argparse.Namespace) -> None:
         except json.JSONDecodeError as e:
             sys.exit(f"bongo: -q is not valid JSON: {e}")
     query = conditions[0] if len(conditions) == 1 else {"$and": conditions} if conditions else {}
-    limit = None if args.count or args.limit == "all" else args.limit or _CAT_DEFAULT_LIMIT
+    return query, words, highlights
+
+
+def _sort_from_args(args: argparse.Namespace) -> dict | None:
     sort_field = args.sort or ("_id" if args.reverse else None)
+    return {sort_field: -1 if args.reverse else 1} if sort_field else None
+
+
+def _field_args(args: argparse.Namespace) -> tuple[list[str], list[list[str]]]:
+    """The -f fields and the -x paths (split on dots)."""
     fields = [f for f in (args.fields or "").split(",") if f]
     excluded = [f.split(".") for f in (args.exclude or "").split(",") if f]
+    return fields, excluded
+
+
+def _mongosh_failed(uri: str, log) -> None:
+    log.seek(0)
+    detail = (log.read().strip().splitlines() or ["no output"])[-1]
+    sys.exit(f"bongo: mongosh failed: {_redact_uri(detail.replace(uri, _redact_uri(uri)))}")
+
+
+def _require_collection(uri: str, cluster_name: str, db: str, collection: str) -> None:
+    names = _mongosh_json(uri, f"db.getSiblingDB({json.dumps(db)}).getCollectionNames()")
+    if collection not in names:
+        sys.exit(
+            f"bongo: no collection '{collection}' in '{cluster_name}:{db}'"
+            f" (collections: {', '.join(sorted(names)) or 'none'})"
+        )
+
+
+def _cmd_cat(config: dict, args: argparse.Namespace) -> None:
+    cluster_name, db = _resolve_address(config, args.database)
+    uri = config["clusters"][cluster_name]["uri"]
+
+    query, words, highlights = _query_from_args(args)
+    limit = None if args.count or args.limit == "all" else args.limit or _CAT_DEFAULT_LIMIT
+    fields, excluded = _field_args(args)
 
     # Bare words are matched client-side, so only without them can the server limit and trim.
     script = _cat_script(
         db, args.collection, query,
-        sort={sort_field: -1 if args.reverse else 1} if sort_field else None,
+        sort=_sort_from_args(args),
         limit=limit + 1 if limit is not None and not words else None,
         id_only=args.count and not words,
     )
@@ -1196,11 +1253,8 @@ def _cmd_cat(config: dict, args: argparse.Namespace) -> None:
     if more:
         proc.kill()
         proc.wait()
-    else:
-        if proc.wait() != 0:
-            log.seek(0)
-            detail = (log.read().strip().splitlines() or ["no output"])[-1]
-            sys.exit(f"bongo: mongosh failed: {_redact_uri(detail.replace(uri, _redact_uri(uri)))}")
+    elif proc.wait() != 0:
+        _mongosh_failed(uri, log)
 
     if args.count:
         print(shown)
@@ -1208,13 +1262,358 @@ def _cmd_cat(config: dict, args: argparse.Namespace) -> None:
         # Only for the implicit limit, and on stderr so the notice never ends up in a pipe.
         print(f"bongo: showing the first {limit} documents, more match — use -n all for everything", file=sys.stderr)
     elif shown == 0:
-        names = _mongosh_json(uri, f"db.getSiblingDB({json.dumps(db)}).getCollectionNames()")
-        if args.collection not in names:
-            sys.exit(
-                f"bongo: no collection '{args.collection}' in '{cluster_name}:{db}'"
-                f" (collections: {', '.join(sorted(names)) or 'none'})"
-            )
+        _require_collection(uri, cluster_name, db, args.collection)
         print("bongo: no documents match", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# edit — open one document in $EDITOR and write back only what changed
+# ---------------------------------------------------------------------------
+
+_EDIT_PICK_LIMIT = 200
+_EDIT_LOG_PATH = Path.home() / ".local" / "share" / "bongo" / "edits.jsonl"
+_MISSING = object()
+
+
+class _EditError(ValueError):
+    """An edit that cannot be written; the user gets to fix it in the editor."""
+
+
+def _friendly(value):
+    """Canonical extended JSON made editable, without losing anything.
+
+    Ints and doubles become plain numbers (doubles keep their '.0'), dates in 1970-9999 become
+    {"$date": "<ISO>"}; longs, decimals and non-finite doubles keep their wrappers.
+    """
+    if isinstance(value, list):
+        return [_friendly(v) for v in value]
+    if not isinstance(value, dict):
+        return value
+    if len(value) == 1:
+        (key, inner), = value.items()
+        if key == "$numberInt":
+            return int(inner)
+        if key == "$numberDouble" and inner not in ("Infinity", "-Infinity", "NaN"):
+            return float(inner)
+        if key == "$date" and isinstance(inner, dict) and "$numberLong" in inner:
+            ms = int(inner["$numberLong"])
+            if 0 <= ms < 253402300800000:  # the range relaxed extended JSON writes as ISO strings
+                at = datetime(1970, 1, 1) + timedelta(milliseconds=ms)
+                return {"$date": at.strftime("%Y-%m-%dT%H:%M:%S") + (f".{ms % 1000:03d}" if ms % 1000 else "") + "Z"}
+    return {k: _friendly(v) for k, v in value.items()}
+
+
+def _exact(value):
+    """Wrap plain numbers as canonical extended JSON, so 2.0 is written as a double and 2 as an int."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return {"$numberInt" if -2**31 <= value < 2**31 else "$numberLong": str(value)}
+    if isinstance(value, float):
+        text = repr(value) if math.isfinite(value) else {"inf": "Infinity", "-inf": "-Infinity"}.get(repr(value), "NaN")
+        return {"$numberDouble": text}
+    if isinstance(value, list):
+        return [_exact(v) for v in value]
+    if _is_subdocument(value):
+        return {k: _exact(v) for k, v in value.items()}
+    return value
+
+
+def _find_docs(uri: str, script: str, words: list[str], cap: int) -> tuple[list[dict], bool]:
+    """Run an exact find script, keeping up to `cap` documents (made _friendly) that contain every word.
+
+    Also returns whether more documents matched.
+    """
+    log = tempfile.TemporaryFile("w+")
+    proc = subprocess.Popen(["mongosh", uri, "--quiet", "--eval", script], stdout=subprocess.PIPE, stderr=log, text=True)
+    docs: list[dict] = []
+    more = False
+    for line in proc.stdout:
+        doc = _friendly(json.loads(line))
+        if words and not _matches_words(_plain(doc), words):
+            continue
+        if len(docs) == cap:
+            more = True
+            break
+        docs.append(doc)
+    if more:
+        proc.kill()
+        proc.wait()
+    elif proc.wait() != 0:
+        _mongosh_failed(uri, log)
+    return docs, more
+
+
+def _id_label(doc: dict) -> str:
+    doc_id = _plain(doc["_id"])
+    return doc_id if isinstance(doc_id, str) else json.dumps(doc_id, ensure_ascii=False)
+
+
+def _pick_doc(docs: list[dict], fields: list[str], excluded: list[list[str]]) -> dict | None:
+    """Pick a document from a list of one-line summaries, previewing each as it will open in the editor."""
+    items = []
+    for doc in docs:  # each item starts with the unique _id, so items.index finds the right document
+        rest = json.dumps({k: v for k, v in _plain(doc).items() if k != "_id"}, ensure_ascii=False)
+        summary = rest if len(rest) <= 120 else rest[:119] + "…"
+        items.append(f"{_id_label(doc)}  {summary}".rstrip())
+    previews = [_render_json(_edit_view(doc, fields, excluded)) for doc in docs]
+    picked = _pick(items, f"edit ({len(docs)} match):", previews)
+    return docs[items.index(picked)] if picked else None
+
+
+def _edit_view(doc: dict, fields: list[str], excluded: list[list[str]]) -> dict:
+    """The part of the document to edit: -f/-x applied, _id always first."""
+    view = copy.deepcopy(doc)
+    if fields:
+        view = _project(view, fields)
+    for path in excluded:
+        _exclude(view, path)
+    view.pop("_id", None)
+    return {"_id": doc["_id"], **view}
+
+
+def _same(a, b) -> bool:
+    """Type-strict equality, so 1 vs 1.0 vs true count as changes."""
+    return json.dumps(a, ensure_ascii=False) == json.dumps(b, ensure_ascii=False)
+
+
+def _is_subdocument(value) -> bool:
+    # A dict with $-keys is an extended JSON value ({"$oid": ...}, {"$date": ...}), edited as a whole.
+    return isinstance(value, dict) and not any(k.startswith("$") for k in value)
+
+
+def _doc_diff(old: dict, new: dict, prefix: tuple = ()) -> list[tuple]:
+    """Changed paths as (path parts, old, new), _MISSING marking an added or removed field.
+
+    Recurses into subdocuments; arrays and other values change as a whole.
+    """
+    ops = []
+    for key in [*old, *(k for k in new if k not in old)]:
+        a, b = old.get(key, _MISSING), new.get(key, _MISSING)
+        if _is_subdocument(a) and _is_subdocument(b):
+            ops += _doc_diff(a, b, (*prefix, key))
+        elif a is _MISSING or b is _MISSING or not _same(a, b):
+            ops.append(((*prefix, key), a, b))
+    return ops
+
+
+def _get_path(doc, parts: tuple):
+    for part in parts:
+        if not isinstance(doc, dict) or part not in doc:
+            return _MISSING
+        doc = doc[part]
+    return doc
+
+
+def _edit_changes(doc: dict, view: dict, edited) -> list[tuple]:
+    """What the edit of `view` (from `doc`) changes, with old values taken from the full document."""
+    if not isinstance(edited, dict):
+        raise _EditError("the document must be a JSON object")
+    if "_id" not in edited or not _same(edited["_id"], doc["_id"]):
+        raise _EditError("_id cannot be changed")
+    partial = not _same(view, doc)
+    ops = []
+    for parts, old, new in _doc_diff(view, edited):
+        path = ".".join(parts)
+        if any(not part or "." in part or part.startswith("$") for part in parts):
+            raise _EditError(f"cannot write field '{path}' (empty, dotted or $-prefixed names)")
+        if partial:
+            full = _get_path(doc, parts)
+            if old is not _MISSING and not _same(old, full):
+                raise _EditError(f"'{path}' contains fields hidden by -f/-x — edit it without them")
+            old = full  # a field hidden from the view may still exist: the diff shows it being overwritten
+            if old is not _MISSING and new is not _MISSING and _same(old, new):
+                continue
+        ops.append((path, old, new))
+    return ops
+
+
+def _edit_update(doc_id, ops: list[tuple]) -> tuple[dict, dict]:
+    """The updateOne filter and update for the changes.
+
+    The filter also requires every changed field to still hold its old value, so a document
+    changed by someone else in the meantime is never overwritten.
+    """
+    query = {"_id": doc_id}
+    sets, unsets = {}, {}
+    for path, old, new in ops:
+        query[path] = {"$exists": False} if old is _MISSING else old
+        if new is _MISSING:
+            unsets[path] = ""
+        else:
+            sets[path] = new
+    update = {}
+    if sets:
+        update["$set"] = sets
+    if unsets:
+        update["$unset"] = unsets
+    return query, update
+
+
+def _update_script(db: str, collection: str, query: dict, update: dict) -> str:
+    """mongosh expression running the updateOne with exact BSON types, yielding {matched, modified}."""
+    exact_query = {path: _exact(value) for path, value in query.items()}  # {"$exists": false} is left as is
+    exact_update = {op: {path: _exact(value) for path, value in fields.items()} for op, fields in update.items()}
+    parse = lambda value: f"EJSON.parse({json.dumps(json.dumps(value, ensure_ascii=False), ensure_ascii=False)}, {{relaxed: false}})"
+    return (
+        f"(() => {{ const r = db.getSiblingDB({json.dumps(db)}).getCollection({json.dumps(collection)})"
+        f".updateOne({parse(exact_query)}, {parse(exact_update)});"
+        " return {matched: r.matchedCount, modified: r.modifiedCount}; })()"
+    )
+
+
+def _render_changes(ops: list[tuple]) -> str:
+    width = max(len(path) for path, _, _ in ops)
+    value = lambda v: json.dumps(v, ensure_ascii=False)
+    lines = []
+    for path, old, new in ops:
+        if old is _MISSING:
+            lines.append(f"  {_c('32', '+')} {path:<{width}}  {_c('32', value(new))}")
+        elif new is _MISSING:
+            lines.append(f"  {_c('31', '-')} {path:<{width}}  {_c('31', value(old))}")
+        else:
+            lines.append(f"  {_c('33', '~')} {path:<{width}}  {_c('31', value(old))} → {_c('32', value(new))}")
+    return "\n".join(lines)
+
+
+_SHELL_CONSTRUCTORS = {"$oid": "ObjectId", "$date": "ISODate", "$numberLong": "NumberLong", "$numberDecimal": "NumberDecimal"}
+
+
+def _shell_literal(value) -> str:
+    """Render relaxed extended JSON as mongosh syntax, ready to paste into a shell."""
+    if isinstance(value, dict):
+        if len(value) == 1:
+            (key, inner), = value.items()
+            if key in _SHELL_CONSTRUCTORS and isinstance(inner, str):
+                return f"{_SHELL_CONSTRUCTORS[key]}({json.dumps(inner)})"
+        if not _is_subdocument(value) and not all(k in ("$exists", "$set", "$unset") for k in value):
+            return f"EJSON.parse({json.dumps(json.dumps(value, ensure_ascii=False), ensure_ascii=False)})"
+        return "{" + ", ".join(f"{json.dumps(k, ensure_ascii=False)}: {_shell_literal(v)}" for k, v in value.items()) + "}"
+    if isinstance(value, list):
+        return "[" + ", ".join(_shell_literal(v) for v in value) + "]"
+    # Numbers the shell would store differently from what bongo writes (see _exact).
+    if isinstance(value, float) and value.is_integer():
+        return f"Double({int(value)})"
+    if isinstance(value, int) and not isinstance(value, bool) and not -2**31 <= value < 2**31:
+        return f'NumberLong("{value}")'
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _run_editor(path: Path) -> int:
+    fallback = "nano" if shutil.which("nano") else "vi"
+    editor = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or fallback)
+    try:
+        return subprocess.run([*editor, str(path)]).returncode
+    except FileNotFoundError:
+        sys.exit(f"bongo: editor not found: {editor[0]} (set $VISUAL or $EDITOR)")
+
+
+def _ask(prompt: str, choices: str, default: str) -> str:
+    """Prompt until the answer starts with one of `choices`; empty picks `default`, EOF/^C means 'n'."""
+    while True:
+        try:
+            answer = input(f"{prompt} ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "n"
+        if not answer:
+            return default
+        if answer[0] in choices:
+            return answer[0]
+
+
+def _log_edit(target: str, collection: str, doc: dict, query: dict, update: dict) -> None:
+    entry = {
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "target": target,
+        "collection": collection,
+        "_id": doc["_id"],
+        "before": doc,
+        "filter": query,
+        "update": update,
+    }
+    try:
+        _EDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_EDIT_LOG_PATH, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"bongo: warning: could not write the edit log {_EDIT_LOG_PATH}: {e}", file=sys.stderr)
+
+
+def _cmd_edit(config: dict, args: argparse.Namespace) -> None:
+    cluster_name, db = _resolve_address(config, args.database)
+    uri = config["clusters"][cluster_name]["uri"]
+    target = f"{cluster_name}:{db}"
+
+    query, words, _ = _query_from_args(args)
+    fields, excluded = _field_args(args)
+    script = _cat_script(
+        db, args.collection, query, sort=_sort_from_args(args),
+        limit=None if words else _EDIT_PICK_LIMIT + 1, exact=True,
+    )
+    docs, more = _find_docs(uri, script, words, _EDIT_PICK_LIMIT)
+    if not docs:
+        _require_collection(uri, cluster_name, db, args.collection)
+        sys.exit("bongo: no documents match")
+    if more:
+        print(f"bongo: more than {_EDIT_PICK_LIMIT} documents match — showing the first {_EDIT_PICK_LIMIT}", file=sys.stderr)
+    doc = docs[0] if len(docs) == 1 else _pick_doc(docs, fields, excluded)
+    if doc is None:
+        sys.exit("bongo: aborted")
+
+    view = _edit_view(doc, fields, excluded)
+    workdir = Path(tempfile.mkdtemp(prefix="bongo-edit-"))
+    name = re.sub(r"[^\w.-]", "_", f"{cluster_name}.{db}.{args.collection}.{_id_label(doc)}")[:120]
+    path = workdir / f"{name}.json"
+    path.write_text(json.dumps(view, indent=2, ensure_ascii=False) + "\n")
+    keep = False
+    try:
+        while True:
+            code = _run_editor(path)
+            if code != 0:
+                sys.exit(f"bongo: editor exited with code {code} — nothing written")
+            try:
+                ops = _edit_changes(doc, view, json.loads(path.read_text()))
+            except (json.JSONDecodeError, _EditError) as e:
+                print(f"bongo: {e}", file=sys.stderr)
+                if _ask(f"{_c('1;33', 'Edit again?')} [{_c('1;32', 'Y')}/{_c('1;31', 'n')}]", "yn", "y") == "y":
+                    continue
+                sys.exit("bongo: aborted")
+            if not ops:
+                print("No changes")
+                return
+
+            query, update = _edit_update(doc["_id"], ops)
+            print(f"{_c('1', target)} {args.collection} {_id_label(doc)}")
+            if _is_protected(config, cluster_name, db):
+                print(_c("1;31", f"⚠ '{target}' is protected"))
+            print(_render_changes(ops))
+            if args.verbose:
+                collection = f"db.getCollection({json.dumps(args.collection)})"
+                print(_c("2", f"{collection}.updateOne(\n  {_shell_literal(query)},\n  {_shell_literal(update)}\n)"))
+            answer = _ask(
+                f"{_c('1;33', 'Apply?')} [{_c('1;32', 'y')}]es / [{_c('1;36', 'e')}]dit again / [{_c('1;31', 'N')}]o",
+                "yen", "n",
+            )
+            if answer == "e":
+                continue
+            if answer == "n":
+                sys.exit("bongo: aborted")
+            break
+
+        result = _mongosh_json(uri, _update_script(db, args.collection, query, update))
+        if not result.get("matched"):
+            keep = True
+            sys.exit(f"bongo: the document changed since it was opened — nothing written (your edit is kept in {path})")
+        if not result.get("modified"):
+            print("Nothing modified — MongoDB considers the new values equal to the old ones")
+            return
+        _log_edit(target, args.collection, doc, query, update)
+        n = len(ops)
+        print(f"Updated {_id_label(doc)} ({n} field{'s' if n != 1 else ''}; original logged to {_EDIT_LOG_PATH})")
+    finally:
+        if not keep:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1235,20 +1634,30 @@ def _cat_depth(value: str) -> int:
     return int(value)
 
 
-def _add_cat_arguments(parser: argparse.ArgumentParser) -> None:
+def _add_query_arguments(parser: argparse.ArgumentParser, verb: str) -> None:
+    """Arguments cat and edit share: where to look, what to match, and which fields to show."""
     parser.add_argument("database", help="database (<cluster>:<db> or <db>)")
-    parser.add_argument("collection", help="collection to print")
+    parser.add_argument("collection", help=f"collection to {verb}")
     parser.add_argument("terms", nargs="*", metavar="TERM", help="bare word (matches anywhere) or field=, !=, ~, >, >=, <, <= value")
-    parser.add_argument("-n", dest="limit", type=_cat_limit, metavar="N",
-                        help=f"print at most N documents, or 'all' (default: {_CAT_DEFAULT_LIMIT})")
     parser.add_argument("-s", "--sort", metavar="FIELD", help="sort by a field")
     parser.add_argument("-r", "--reverse", action="store_true", help="sort descending (by _id, newest first, without -s)")
-    parser.add_argument("-f", "--fields", metavar="A,B", help="only print these fields (plus _id)")
+    parser.add_argument("-f", "--fields", metavar="A,B", help=f"only {verb} these fields (plus _id)")
     parser.add_argument("-x", "--exclude", metavar="A,B", help="leave these fields out")
+    parser.add_argument("-q", "--query", metavar="JSON", help="raw MongoDB query (extended JSON), ANDed with the terms")
+
+
+def _add_cat_arguments(parser: argparse.ArgumentParser) -> None:
+    _add_query_arguments(parser, "print")
+    parser.add_argument("-n", dest="limit", type=_cat_limit, metavar="N",
+                        help=f"print at most N documents, or 'all' (default: {_CAT_DEFAULT_LIMIT})")
     parser.add_argument("-d", "--depth", type=_cat_depth, metavar="N",
                         help="collapse objects and arrays nested deeper than N levels (1 = top-level fields only)")
     parser.add_argument("-c", "--count", action="store_true", help="print the number of matching documents instead")
-    parser.add_argument("-q", "--query", metavar="JSON", help="raw MongoDB query (extended JSON), ANDed with the terms")
+
+
+def _add_edit_arguments(parser: argparse.ArgumentParser) -> None:
+    _add_query_arguments(parser, "edit")
+    parser.add_argument("-v", "--verbose", action="store_true", help="also print the updateOne command that will run")
 
 
 def _parse_cat_args(argv: list[str]) -> argparse.Namespace:
@@ -1273,6 +1682,30 @@ def _parse_cat_args(argv: list[str]) -> argparse.Namespace:
     # Intermixed, so flags may come before, between or after the terms.
     args = parser.parse_intermixed_args(argv)
     args.command = "cat"
+    return args
+
+
+def _parse_edit_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="bongo edit",
+        description=(
+            "Edit one document in $VISUAL/$EDITOR (else nano, else vi), then review the changed fields and confirm.\n"
+            "Matches documents like 'bongo cat'; when several match, pick one. Only the changed fields are\n"
+            "written ($set/$unset), and only if they still hold the values you started from."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  bongo edit main users axel@example.com\n"
+            "  bongo edit main users 65f1c0ffee65f1c0ffee65f1\n"
+            "  bongo edit main users axel -f settings   # edit only the settings field\n"
+            "  bongo edit dev:main orders status=stuck -r -v\n"
+            f"\nEvery applied edit is logged, with the original document, to {_EDIT_LOG_PATH}\n"
+        ),
+    )
+    _add_edit_arguments(parser)
+    args = parser.parse_intermixed_args(argv)
+    args.command = "edit"
     return args
 
 
@@ -1314,6 +1747,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, argparse._SubParsersAction
             "  bongo run adduser pr-539          # run a configured script label on a database\n"
             "  bongo run ./fix.js atlas-dev:main # run a one-off script file\n"
             "  bongo cat main users axel         # print documents mentioning 'axel' (see: bongo cat -h)\n"
+            "  bongo edit main users axel        # edit that document in $EDITOR (see: bongo edit -h)\n"
             "  bongo diff main pr-539            # collection/count/index differences\n"
             "  bongo ls                          # databases on the default cluster\n"
             "  bongo ls atlas-dev\n"
@@ -1373,6 +1807,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, argparse._SubParsersAction
     cat = sub.add_parser("cat", help="print documents from a collection, with simple filters")
     _add_cat_arguments(cat)
 
+    edit = sub.add_parser("edit", help="edit one document in your editor, then confirm the diff")
+    _add_edit_arguments(edit)
+
     diff = sub.add_parser("diff", help="compare two databases (collections, doc counts, indexes)")
     diff.add_argument("a", help="first database (<cluster>:<db> or <db>)")
     diff.add_argument("b", help="second database (<cluster>:<db> or <db>)")
@@ -1392,6 +1829,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         return _parse_run_args(raw_argv[1:])
     if raw_argv[:1] == ["cat"]:
         return _parse_cat_args(raw_argv[1:])
+    if raw_argv[:1] == ["edit"]:
+        return _parse_edit_args(raw_argv[1:])
     return _build_parser()[0].parse_args(raw_argv)
 
 
@@ -1416,6 +1855,7 @@ _COMPLETE_POSITIONALS = {
     "sh": ["db"],
     "run": ["script", "db"],
     "cat": ["db", "collection"],
+    "edit": ["db", "collection"],
     "diff": ["db", "db"],
     "completion": ["shell"],
 }
@@ -1646,3 +2086,6 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "cat":
         _require_tools("mongosh")
         _cmd_cat(config, args)
+    elif args.command == "edit":
+        _require_tools("mongosh")
+        _cmd_edit(config, args)

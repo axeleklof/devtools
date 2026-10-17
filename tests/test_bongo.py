@@ -303,6 +303,295 @@ def test_cat_highlights_search_matches(monkeypatch: pytest.MonkeyPatch) -> None:
     assert bongo._render_json({"age": 23}, highlights=bongo._parse_cat_terms(["23"])[2]) == '{\n  "age": <23>\n}'
 
 
+_OID = {"$oid": "65f1c0ffee65f1c0ffee65f1"}
+
+
+def test_edit_diff_recurses_into_subdocuments_and_keeps_types_strict() -> None:
+    old = {
+        "_id": _OID,
+        "role": "user",
+        "score": 1,
+        "settings": {"theme": "light", "lang": "sv"},
+        "tags": ["a"],
+        "created": {"$date": "2026-01-01T00:00:00Z"},
+        "legacy": "x",
+    }
+    new = {
+        "_id": _OID,
+        "role": "admin",
+        "score": 1.0,
+        "settings": {"theme": "dark", "lang": "sv", "beta": True},
+        "tags": ["a", "b"],
+        "created": "2026-01-01T00:00:00Z",
+    }
+
+    ops = bongo._edit_changes(old, old, new)
+
+    assert [(path, old_v, new_v) for path, old_v, new_v in ops] == [
+        ("role", "user", "admin"),
+        ("score", 1, 1.0),
+        ("settings.theme", "light", "dark"),
+        ("settings.beta", bongo._MISSING, True),
+        ("tags", ["a"], ["a", "b"]),
+        ("created", {"$date": "2026-01-01T00:00:00Z"}, "2026-01-01T00:00:00Z"),
+        ("legacy", "x", bongo._MISSING),
+    ]
+    query, update = bongo._edit_update(_OID, ops)
+    assert query == {
+        "_id": _OID,
+        "role": "user",
+        "score": 1,
+        "settings.theme": "light",
+        "settings.beta": {"$exists": False},
+        "tags": ["a"],
+        "created": {"$date": "2026-01-01T00:00:00Z"},
+        "legacy": "x",
+    }
+    assert update == {
+        "$set": {
+            "role": "admin", "score": 1.0, "settings.theme": "dark", "settings.beta": True,
+            "tags": ["a", "b"], "created": "2026-01-01T00:00:00Z",
+        },
+        "$unset": {"legacy": ""},
+    }
+    assert bongo._edit_changes(old, old, dict(old)) == []
+
+
+def test_edit_rejects_bad_edits() -> None:
+    doc = {"_id": _OID, "name": "x"}
+
+    for edited, message in [
+        ([], "JSON object"),
+        ({"name": "x"}, "_id cannot be changed"),
+        ({"_id": {"$oid": "000000000000000000000000"}, "name": "x"}, "_id cannot be changed"),
+        ({"_id": _OID, "a.b": 1}, "dotted"),
+        ({"_id": _OID, "$bad": 1}, "dotted or \\$-prefixed"),
+    ]:
+        with pytest.raises(bongo._EditError, match=message):
+            bongo._edit_changes(doc, doc, edited)
+
+
+def test_edit_view_with_fields_and_hidden_content() -> None:
+    doc = {
+        "_id": _OID,
+        "name": "Axel",
+        "settings": {"theme": "light", "lang": "sv"},
+        "logins": [{"ip": "1.1.1.1", "at": "x"}],
+    }
+
+    view = bongo._edit_view(doc, ["settings.theme"], [])
+    assert view == {"_id": _OID, "settings": {"theme": "light"}}
+    # Editing a shown field is fine; adding a field that exists but was hidden overwrites it, visibly.
+    ops = bongo._edit_changes(doc, view, {"_id": _OID, "settings": {"theme": "dark"}, "name": "Bob"})
+    assert ops == [("settings.theme", "light", "dark"), ("name", "Axel", "Bob")]
+    # Removing a subdocument would also drop its hidden fields.
+    with pytest.raises(bongo._EditError, match="'settings' contains fields hidden"):
+        bongo._edit_changes(doc, view, {"_id": _OID})
+
+    view = bongo._edit_view(doc, [], [["_id"], ["logins", "ip"]])
+    assert view == {"_id": _OID, "name": "Axel", "settings": doc["settings"], "logins": [{"at": "x"}]}
+    assert doc["logins"] == [{"ip": "1.1.1.1", "at": "x"}]  # the original is untouched
+    with pytest.raises(bongo._EditError, match="'logins' contains fields hidden"):
+        bongo._edit_changes(doc, view, {**view, "logins": []})
+    assert bongo._edit_changes(doc, view, {**view, "name": "Bob"}) == [("name", "Axel", "Bob")]
+
+
+def test_edit_keeps_bson_types_exact() -> None:
+    canonical = {
+        "i": {"$numberInt": "2"},
+        "d": {"$numberDouble": "2.0"},
+        "nan": {"$numberDouble": "NaN"},
+        "long": {"$numberLong": "9007199254740993"},
+        "at": {"$date": {"$numberLong": "1767225600500"}},
+        "old": {"$date": {"$numberLong": "-1000"}},
+        "nested": [{"n": {"$numberInt": "1"}}],
+    }
+
+    doc = bongo._friendly(canonical)
+
+    assert doc == {
+        "i": 2, "d": 2.0, "nan": {"$numberDouble": "NaN"}, "long": {"$numberLong": "9007199254740993"},
+        "at": {"$date": "2026-01-01T00:00:00.500Z"}, "old": {"$date": {"$numberLong": "-1000"}}, "nested": [{"n": 1}],
+    }
+    assert bongo.json.dumps(doc["d"]) == "2.0"  # the double stays recognisable in the editor
+    assert bongo._exact(doc) == {**canonical, "at": {"$date": "2026-01-01T00:00:00.500Z"}}
+    assert bongo._exact([True, 2**40, float("inf")]) == [True, {"$numberLong": str(2**40)}, {"$numberDouble": "Infinity"}]
+
+    script = bongo._update_script("main", "users", {"_id": _OID, "n": 2, "m": {"$exists": False}}, {"$set": {"n": 2.0}})
+    assert '\\"n\\": {\\"$numberInt\\": \\"2\\"}' in script
+    assert '\\"m\\": {\\"$exists\\": false}' in script
+    assert '{\\"$set\\": {\\"n\\": {\\"$numberDouble\\": \\"2.0\\"}}}' in script
+    assert script.count("{relaxed: false}") == 2
+
+
+def test_edit_shell_literal() -> None:
+    query, update = bongo._edit_update(
+        _OID, [("at", {"$date": "2026-01-01T00:00:00Z"}, bongo._MISSING), ("n", bongo._MISSING, {"$numberLong": "9007199254740993"})]
+    )
+
+    assert bongo._shell_literal(query) == (
+        '{"_id": ObjectId("65f1c0ffee65f1c0ffee65f1"), "at": ISODate("2026-01-01T00:00:00Z"), "n": {"$exists": false}}'
+    )
+    assert bongo._shell_literal(update) == '{"$set": {"n": NumberLong("9007199254740993")}, "$unset": {"at": ""}}'
+    assert bongo._shell_literal({"$binary": {"base64": "", "subType": "00"}}).startswith("EJSON.parse(")
+    assert bongo._shell_literal([2, 2.0, 2.5, 2**40]) == '[2, Double(2), 2.5, NumberLong("1099511627776")]'
+
+
+def test_edit_args() -> None:
+    args = bongo.parse_args(["edit", "main", "users", "axel", "-v", "-f", "settings"])
+
+    assert args.command == "edit"
+    assert (args.database, args.collection, args.terms) == ("main", "users", ["axel"])
+    assert args.verbose is True and args.fields == "settings"
+    with pytest.raises(SystemExit):
+        bongo.parse_args(["edit", "main", "users", "-n", "3"])
+
+
+_EDIT_DOCS = [
+    {"_id": _OID, "name": "Axel", "role": "user"},
+    {"_id": {"$oid": "000000000000000000000001"}, "name": "Bob", "role": "user"},
+]
+
+
+def _run_edit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    argv: list[str],
+    edits: list,
+    answers: list[str],
+    matched: int = 1,
+    picked: int | None = None,
+) -> dict:
+    """Run `bongo edit` with fake mongosh, editor, prompts and picker; returns what was observed."""
+    seen: dict = {"commands": [], "updates": [], "buffers": []}
+
+    def popen(cmd, **kwargs):
+        seen["commands"].append(cmd)
+        return _FakeExport([bongo.json.dumps(doc) + "\n" for doc in _EDIT_DOCS])
+
+    def editor(path: Path) -> int:
+        seen["buffers"].append(path.read_text())
+        edit = edits.pop(0)
+        if isinstance(edit, int):
+            return edit
+        path.write_text(edit if isinstance(edit, str) else bongo.json.dumps(edit))
+        return 0
+
+    def mongosh_json(uri: str, expression: str, timeout: float = 30):
+        seen["updates"].append(expression)
+        return {"matched": matched, "modified": matched}
+
+    def pick(items: list[str], prompt: str, previews=None):
+        seen["picker"] = items
+        seen["previews"] = previews
+        return items[picked] if picked is not None else None
+
+    monkeypatch.setattr(bongo.subprocess, "Popen", popen)
+    monkeypatch.setattr(bongo, "_run_editor", editor)
+    monkeypatch.setattr(bongo, "_mongosh_json", mongosh_json)
+    monkeypatch.setattr(bongo, "_pick", pick)
+    monkeypatch.setattr("builtins.input", lambda prompt: answers.pop(0))
+    monkeypatch.setattr(bongo, "_EDIT_LOG_PATH", tmp_path / "edits.jsonl")
+    config = {"default": "local", "clusters": {"local": {"uri": "mongodb://localhost:27017", "protected": ["main"]}}}
+    try:
+        bongo._cmd_edit(config, bongo.parse_args(["edit", *argv]))
+    except SystemExit as e:
+        seen["exit"] = e.code
+    return seen
+
+
+def test_edit_applies_reviewed_changes_and_logs_them(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen = _run_edit(
+        monkeypatch, tmp_path, ["main", "users", "axel", "-v"],
+        edits=[{"_id": _OID, "name": "Axel", "role": "admin"}], answers=["y"],
+    )
+
+    out = capsys.readouterr().out
+    assert "exit" not in seen
+    assert [bongo.json.loads(b) for b in seen["buffers"]] == [_EDIT_DOCS[0]]  # bare word 'axel' filtered client-side to one doc
+    assert ".limit(" not in seen["commands"][0][-1]
+    assert "'local:main' is protected" in out
+    assert '~ role  "user" → "admin"' in out
+    assert 'updateOne(\n  {"_id": ObjectId("65f1c0ffee65f1c0ffee65f1"), "role": "user"},\n  {"$set": {"role": "admin"}}\n)' in out
+    assert "Updated 65f1c0ffee65f1c0ffee65f1 (1 field;" in out
+    assert '\\"$set\\":{\\"role\\":\\"admin\\"}' in seen["updates"][0].replace(" ", "")
+    entry = bongo.json.loads((tmp_path / "edits.jsonl").read_text())
+    assert entry["target"] == "local:main" and entry["before"] == _EDIT_DOCS[0]
+    assert entry["update"] == {"$set": {"role": "admin"}}
+
+
+def test_edit_picks_among_matches_and_reopens_on_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bob = _EDIT_DOCS[1]
+    seen = _run_edit(
+        monkeypatch, tmp_path, ["main", "users"],
+        edits=["{not json", {**bob, "_id": "x"}, {**bob, "role": "admin"}, {**bob, "role": "owner"}],
+        answers=["", "y", "e", "n"],
+        picked=1,
+    )
+
+    assert seen["picker"][1] == '000000000000000000000001  {"name": "Bob", "role": "user"}'
+    assert bongo.json.loads(seen["previews"][1]) == bob  # pretty-printed as it opens in the editor
+    assert len(seen["previews"][1].splitlines()) == 7  # multi-line, not one compact line
+    assert ".limit(201)" in seen["commands"][0][-1]
+    # The buffer opens with the document, and each reopen keeps what was typed so far.
+    assert [bongo.json.loads(seen["buffers"][0])] == [bob]
+    assert seen["buffers"][1:] == ["{not json", bongo.json.dumps({**bob, "_id": "x"}), bongo.json.dumps({**bob, "role": "admin"})]
+    assert seen["exit"] == "bongo: aborted"
+    assert seen["updates"] == []
+    err = capsys.readouterr().err
+    assert "Expecting property name" in err and "_id cannot be changed" in err
+
+
+def test_pick_with_previews_shows_them_in_an_fzf_pane(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict = {}
+
+    def run(cmd, input, **kwargs):
+        seen["cmd"], seen["input"] = cmd, input
+        workdir = cmd[cmd.index("--preview") + 1].split()[1].rsplit("/", 1)[0]
+        seen["preview_1"] = Path(workdir, "1").read_text()
+        return subprocess.CompletedProcess(cmd, 0, "1\tsecond item\n", "")
+
+    monkeypatch.setattr(bongo.shutil, "which", lambda tool: "/usr/bin/fzf")
+    monkeypatch.setattr(bongo.subprocess, "run", run)
+
+    assert bongo._pick(["first item", "second item"], "pick:", ["one\n1", "two\n2"]) == "second item"
+    assert seen["input"] == "0\tfirst item\n1\tsecond item"
+    assert seen["preview_1"] == "two\n2"
+    assert seen["cmd"][seen["cmd"].index("--with-nth") + 1] == "2.."
+    assert seen["cmd"][seen["cmd"].index("--preview-window") + 1].startswith("right:")
+
+
+def test_edit_without_changes_or_with_editor_failure_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen = _run_edit(monkeypatch, tmp_path, ["main", "users", "axel"], edits=[_EDIT_DOCS[0]], answers=[])
+    assert "No changes" in capsys.readouterr().out
+    assert seen["updates"] == []
+
+    seen = _run_edit(monkeypatch, tmp_path, ["main", "users", "axel"], edits=[1], answers=[])
+    assert seen["exit"] == "bongo: editor exited with code 1 — nothing written"
+
+    seen = _run_edit(monkeypatch, tmp_path, ["main", "users"], edits=[], answers=[])
+    assert seen["exit"] == "bongo: aborted"  # picker dismissed
+
+
+def test_edit_conflict_keeps_the_edited_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen = _run_edit(
+        monkeypatch, tmp_path, ["main", "users", "axel"],
+        edits=[{**_EDIT_DOCS[0], "role": "admin"}], answers=["y"], matched=0,
+    )
+
+    assert "changed since it was opened" in seen["exit"]
+    kept = Path(seen["exit"].rsplit(" ", 1)[1].rstrip(")"))
+    assert bongo.json.loads(kept.read_text())["role"] == "admin"
+    assert not (tmp_path / "edits.jsonl").exists()
+    bongo.shutil.rmtree(kept.parent)
+
+
 def test_ls_database_lists_collections(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

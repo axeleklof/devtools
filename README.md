@@ -123,6 +123,7 @@ bongo run ./fix.js atlas-dev:staging  # run a one-off script file
 bongo diff main pr-539                # compare collections, doc counts and indexes
 bongo cat main users                  # print documents (first 10; -n all for everything)
 bongo cat main users axel role=admin  # ...filtered: 'axel' anywhere, and role equal to admin
+bongo edit main users axel            # edit that document in $EDITOR, review the diff, confirm
 bongo ls                              # list databases on the default cluster (with sizes)
 bongo ls atlas-dev
 bongo ls atlas-dev:main                # list collections in a database (with doc counts)
@@ -180,6 +181,24 @@ bongo cat dev:main users -n all | jq .email
 ```
 
 Values are typed for you: `true`/`false`/`null`, ObjectIds, ISO dates, and numbers (`zip=12345` matches both `12345` and `"12345"`). Flags: `-n N|all` (default 10, with a notice on stderr when more match), `-s FIELD` sort, `-r` descending (by `_id` without `-s`), `-f a,b` fields, `-x a,b` exclude fields, `-d N` collapse anything nested deeper than N levels into a placeholder (a string like `"{… 3 fields}"` when piped), `-c` count, `-q JSON` raw query. Output is pretty-printed and colored on a terminal, and one JSON document per line when piped; ObjectIds and dates are printed as plain strings. Bare words are matched client-side, so on a large remote collection prefer `field~word`.
+
+`bongo edit DATABASE COLLECTION [TERM...]` opens one document in `$VISUAL`/`$EDITOR` (else `nano`, else `vi`). When you save and quit, it shows which fields changed and asks before writing anything:
+
+```bash
+bongo edit main users axel@example.com    # same terms and -q/-s/-r as cat; several matches open a picker with a preview
+bongo edit main users axel -f settings    # edit only some fields (-x hides fields instead)
+bongo edit dev:main orders status=stuck -r -v   # -v also prints the updateOne it will run
+```
+
+```
+local:main users 65f1c0ffee65f1c0ffee65f1
+  ~ role            "user" → "admin"
+  + settings.beta   true
+  - legacyToken     "abc123"
+Apply? [y]es / [e]dit again / [N]o
+```
+
+Only the changed fields are written (`$set`/`$unset`, arrays as a whole), and only if they still hold the values you started from. If someone else changed them in the meantime, nothing is written and your edited file is kept. The buffer is extended JSON with exact types: doubles keep their `.0`, dates and ObjectIds are `{"$date": ...}`/`{"$oid": ...}`, and longs stay `{"$numberLong": ...}`. A field you don't touch is never rewritten. Invalid JSON or a changed `_id` reopens the editor, and quitting with `:cq` aborts. Protected databases get a warning banner. Every applied edit, including the original document, is appended to `~/.local/share/bongo/edits.jsonl`.
 
 Databases are addressed as `<cluster>:<db>`; a bare `<db>` uses the default cluster. Clusters are defined in `~/.config/bongo/config.toml`:
 
